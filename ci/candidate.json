@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "repository": "roberttree/Program-ai-desktop-update-tests",
+  "version": "1.0.9",
+  "baseVersion": "1.0.8",
+  "teamId": "LH2479Y2F4",
+  "bundleId": "com.programai.desktop",
+  "source": {
+    "repository": "roberttree/Program-ai-desktop",
+    "commit": "26a6a062e2ec7513deed13a271b681d513a331cd",
+    "tag": "program-ai-desktop-v1.0.9",
+    "tagObject": "87044fbb69d8871a03ec5f2c992c42c314ebd9ae"
+  },
+  "artifacts": {
+    "arm64": {
+      "dmg": {
+        "name": "Program-AI-Desktop-mac-arm64.dmg",
+        "bytes": 147877529,
+        "sha256": "05e2b9fa878083084e3896b3d63aa68e3481e8d92db7f99a4917a3fb1ed998aa",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-arm64.dmg"
+      },
+      "zip": {
+        "name": "Program-AI-Desktop-mac-arm64.zip",
+        "bytes": 147180408,
+        "sha256": "2002d9d56c447396555ea7c48a74ae4b2be973aa4a526137ddab82881bce3ed2",
+        "sha512": "R3NzwmrNscAesU5jRrEkGvnrnr8NuDXEeYYV1G/ke1IZfsD1GjkKhf8Y1dM1nZ67TJeOORl+f1MAeYhTaiZgiQ==",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-arm64.zip"
+      },
+      "zipBlockmap": {
+        "name": "Program-AI-Desktop-mac-arm64.zip.blockmap",
+        "bytes": 154909,
+        "sha256": "679ad3ec84029a8b248ae9f3bfb6d8b391aa8d851b0dc9e8d65e7ca8cbb00907",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-arm64.zip.blockmap"
+      },
+      "badSignatureZip": {
+        "name": "Program-AI-Desktop-mac-arm64.invalid-signature.zip",
+        "bytes": 147677905,
+        "sha256": "3b8f554822481e7f1ff79619bd7f482685ac03d5e90eaf1bce5fac6ad3a9f3e3",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-arm64.invalid-signature.zip"
+      },
+      "baseZip": {
+        "name": "Program-AI-Desktop-mac-arm64.zip",
+        "bytes": 147177565,
+        "sha256": "593c0922b33603948bdaccd6ad53e617c594193674c5b79bf9c21e2e7a715a60",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.8/Program-AI-Desktop-mac-arm64.zip"
+      }
+    },
+    "x64": {
+      "dmg": {
+        "name": "Program-AI-Desktop-mac-x64.dmg",
+        "bytes": 154980987,
+        "sha256": "7695f7fc937cd0b130ffbf63a554b1ffde0558ac5e3628c6f9ad9f90aed6c3f7",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-x64.dmg"
+      },
+      "zip": {
+        "name": "Program-AI-Desktop-mac-x64.zip",
+        "bytes": 154338607,
+        "sha256": "af09313a9d22a79d0a8f80d775c3b13716a7b4920d1b2f9012a1fe2a81bdda09",
+        "sha512": "ZHogRGHZx90El10K1pngRl0tKU5VumAyfqk19oZ6OmJcXN5jx4twBOav+8YpEOd1AsFwAT/D3dcm7Wn0vgBufg==",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-x64.zip"
+      },
+      "zipBlockmap": {
+        "name": "Program-AI-Desktop-mac-x64.zip.blockmap",
+        "bytes": 162585,
+        "sha256": "b5216c002f16d9e4a0bb2c4fc35dd1324dd4595b3f90b403922b9667f9a34f62",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-x64.zip.blockmap"
+      },
+      "badSignatureZip": {
+        "name": "Program-AI-Desktop-mac-x64.invalid-signature.zip",
+        "bytes": 154945393,
+        "sha256": "69fe8b12405cc1327da86adb3977ad7e08990d42d80b953f5b396beb1da78126",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.9/Program-AI-Desktop-mac-x64.invalid-signature.zip"
+      },
+      "baseZip": {
+        "name": "Program-AI-Desktop-mac-x64.zip",
+        "bytes": 154334866,
+        "sha256": "89dda76598b49e999756404001df2e357bad13aab51d1b695664f51a8992e08a",
+        "url": "https://github.com/roberttree/Program-ai-desktop-update-tests/releases/download/v1.0.8/Program-AI-Desktop-mac-x64.zip"
+      }
+    }
+  }
+}
