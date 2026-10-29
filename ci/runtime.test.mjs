@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   PUBLIC_REPOSITORY, VerificationFailure, approvedRedirect, loopbackWebSocket, parseUpdaterConfiguration,
-  quarantineRecord, receipt, signatureIdentity, validateArtifact, validateCiFacts, validatePins, validateZipArchive,
+  quarantineRecord, receipt, signatureIdentity, validateArtifact, validateCiFacts, validateMachOInventory, validatePins, validateZipArchive,
 } from "./runtime.mjs";
 
 const hash = "a".repeat(64);
@@ -88,6 +88,81 @@ test("Developer ID, expected team, product identifier and hardened runtime are a
   for (const invalid of [value.replace("LH2479Y2F4", "WRONGTEAM1"), value.replace("com.programai.desktop", "com.other.app"),
     value.replace("Developer ID Application:", "Apple Development:"), value.replace("(runtime)", "(none)")])
     failure(() => signatureIdentity(invalid, pins()), "signing_identity_mismatch");
+});
+
+function nativeInventory(arch = "arm64") {
+  const directory = (cpu) => `Contents/Resources/app.asar.unpacked/node_modules/@msgpackr-extract/msgpackr-extract-darwin-${cpu}`;
+  return { arch, version: "1.0.9", files: [
+    { relativePath: "Contents/MacOS/Program AI Desktop", slices: arch === "x64" ? "x86_64" : "arm64" },
+    { relativePath: "Contents/Resources/sidecar", slices: arch === "x64" ? "x86_64" : "arm64" },
+    ...["arm64", "x64"].map((cpu) => ({ relativePath: `${directory(cpu)}/node.napi.glibc.node`, slices: cpu === "x64" ? "x86_64" : "arm64" })),
+  ], resources: [
+    { cpu: "arm64", metadata: { name: "@msgpackr-extract/msgpackr-extract-darwin-arm64", version: "3.0.4", os: ["darwin"], cpu: ["arm64"] },
+      metadataSha256: "115e306fbd59af670a4e85f5cc41900d90344211e65d6a91122c018132df48d6",
+      binarySha256: arch === "arm64" ? "09faedccf609dde6fb72ca7d58a15e7e8d0baa3750a7bba26cf21e9119014745" : "c16822ba903aea8fa2d137573104f2bae2052b663f991324bac4f65c0d60e0d9" },
+    { cpu: "x64", metadata: { name: "@msgpackr-extract/msgpackr-extract-darwin-x64", version: "3.0.4", os: ["darwin"], cpu: ["x64"] },
+      metadataSha256: "753a3d68c775279b70dd7b5dc7c6868f9832d4d2090a8d428c98342b99989483",
+      binarySha256: arch === "arm64" ? "fc5e0de17cd6dd5ba7ce4043ee39ae9f3b278e7830d2d16e38aef51fc76a01e8" : "4ae10898c6468be2b2a59592541182bf28b7857404c02e64c92f53659a22d7ea" },
+  ], loaders: {
+    "node_modules/msgpackr-extract/index.js": "a2b9244e83810de461c09f0cd3629899619bf145a40bc05af44553faf40b9ff5",
+    "node_modules/node-gyp-build-optional-packages/index.js": "a7ed0d5ae218a19bdbdf15a590d0893790ddf536313b66a787554693cfaae078",
+    "node_modules/node-gyp-build-optional-packages/node-gyp-build.js": "21145626bbb3122baf79f196087f05d6f1eeb7b9c65c037ced6940c5c6113440",
+  } };
+}
+
+test("architecture policy permits only the exact paired, pinned conditional msgpackr resources", () => {
+  assert.equal(validateMachOInventory(nativeInventory("arm64")), true);
+  assert.equal(validateMachOInventory(nativeInventory("x64")), true);
+  for (const arch of ["arm64", "x64"]) {
+    const previous = nativeInventory(arch); previous.version = "1.0.8";
+    previous.resources[0].binarySha256 = arch === "arm64" ? "f4f350b4fcbadd64759f639989e42de84cc099658f79817311fd11479810c56f" : "d916b8c89dcfb91d0fe66281a7b33fbe453b182eb6a4759b40aec0b3d4464450";
+    previous.resources[1].binarySha256 = arch === "arm64" ? "5647133ba13f3046bd2fd4550f75a603e43f535c23f33d1bea0f011f4f1f8af9" : "b87080295249b4863652366929a54fa1d198058978a8414194e88d8ad843532f";
+    assert.equal(validateMachOInventory(previous), true);
+  }
+  const unreviewed = nativeInventory(); unreviewed.version = "1.0.10";
+  failure(() => validateMachOInventory(unreviewed), "optional_resource_version_unreviewed");
+  const crossVersion = nativeInventory(); crossVersion.version = "1.0.8";
+  failure(() => validateMachOInventory(crossVersion), "optional_resource_hash_mismatch");
+});
+
+test("main, sidecar, helpers and all other native files remain exact thin target architecture", () => {
+  for (const index of [0, 1]) for (const slices of ["x86_64", "arm64 x86_64", "arm64 arm64", "arm64 unknown", ""]) {
+    const value = nativeInventory(); value.files[index].slices = slices;
+    failure(() => validateMachOInventory(value), "bundle_architecture_mismatch");
+  }
+  const other = nativeInventory();
+  other.files.push({ relativePath: "Contents/Resources/unknown.node", slices: "x86_64" });
+  failure(() => validateMachOInventory(other), "bundle_architecture_mismatch");
+});
+
+test("conditional addons reject wrong path, declared slices, missing native pair and duplicate resource facts", () => {
+  const path = nativeInventory(); path.files[3].relativePath += ".other";
+  failure(() => validateMachOInventory(path), "bundle_architecture_mismatch");
+  for (const slices of ["arm64", "arm64 x86_64", "x86_64 x86_64", "x86_64 unknown"]) {
+    const value = nativeInventory(); value.files[3].slices = slices;
+    failure(() => validateMachOInventory(value), "bundle_architecture_mismatch");
+  }
+  const missingNative = nativeInventory(); missingNative.files.splice(2, 1);
+  failure(() => validateMachOInventory(missingNative), "optional_resource_pair_missing");
+  const missingOther = nativeInventory(); missingOther.resources.pop();
+  failure(() => validateMachOInventory(missingOther), "optional_resource_pair_missing");
+  const duplicate = nativeInventory(); duplicate.resources[1] = duplicate.resources[0];
+  failure(() => validateMachOInventory(duplicate), "optional_resource_pair_missing");
+});
+
+test("conditional resources require exact reviewed metadata, per-bundle binary hashes and loader hashes", () => {
+  for (const patch of [{ name: "other" }, { version: "3.0.5" }, { os: ["linux"] }, { cpu: ["x64"] }, { cpu: ["arm64", "x64"] }]) {
+    const value = nativeInventory(); Object.assign(value.resources[0].metadata, patch);
+    failure(() => validateMachOInventory(value), "optional_resource_metadata_mismatch");
+  }
+  const metadata = nativeInventory(); metadata.resources[0].metadataSha256 = hash;
+  failure(() => validateMachOInventory(metadata), "optional_resource_metadata_mismatch");
+  const binary = nativeInventory(); binary.resources[0].binarySha256 = nativeInventory("x64").resources[0].binarySha256;
+  failure(() => validateMachOInventory(binary), "optional_resource_hash_mismatch");
+  const loader = nativeInventory(); loader.loaders["node_modules/node-gyp-build-optional-packages/node-gyp-build.js"] = hash;
+  failure(() => validateMachOInventory(loader), "optional_resource_loader_mismatch");
+  const missing = nativeInventory(); delete missing.loaders["node_modules/msgpackr-extract/index.js"];
+  failure(() => validateMachOInventory(missing), "optional_resource_loader_mismatch");
 });
 
 test("shipping updater parsing rejects feed substitutions, unsafe cache segments and duplicate fields", () => {

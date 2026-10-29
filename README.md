@@ -19,6 +19,15 @@ Actual artifact hashes and signatures are checked before execution. Missing
 native browser/diagnostic capability is **unverified**, not a product pass.
 Fuses, TCC, Gatekeeper, quarantine, and signature checks must never be weakened.
 
+The two reviewed versions include paired conditional `msgpackr-extract` platform
+resources. The verifier checks their exact paths, package metadata, declared
+CPU, signed binary hashes, and loader hashes; the loader selects the current
+platform/architecture. This narrow resource rule does not admit other
+wrong-architecture code. The main executable and every other native component
+must match the requested architecture, and actual native launch remains a
+separate required check. The original failed inventory run is not a native-app
+pass and remains in the public test history.
+
 ## Candidate evidence
 
 `ci/candidate.json` pins exact already-signed assets, source metadata, hashes,
