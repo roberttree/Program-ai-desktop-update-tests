@@ -317,11 +317,11 @@ export async function validateStaple(filename) {
   throw new VerificationFailure(missing ? "failed" : "unverified", missing ? "stapled_ticket_missing" : "ticket_validation_unverified");
 }
 
-async function verifyMachOFiles(app, arch) {
+async function verifyMachOFiles(app, arch, version) {
   const root = await realpath(app);
   const visited = new Set();
   let files = 0;
-  let machO = 0;
+  const nativeFiles = [];
   async function visit(candidate) {
     const canonical = await realpath(candidate);
     check(canonical === root || canonical.startsWith(root + path.sep), "bundle_symlink_escape", "failed");
@@ -339,11 +339,109 @@ async function verifyMachOFiles(app, arch) {
     try { await file.read(bytes, 0, 4, 0); } finally { await file.close(); }
     if (![0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].includes(bytes.readUInt32BE(0))) return;
     const slices = (await run("/usr/bin/lipo", ["-archs", canonical])).stdout.trim();
-    check(slices === (arch === "x64" ? "x86_64" : "arm64"), "bundle_architecture_mismatch", "failed");
-    machO++;
+    nativeFiles.push({ relativePath: path.relative(root, canonical), slices });
   }
   await visit(root);
-  check(machO > 1, "bundle_native_code_missing", "failed");
+  const resources = [];
+  for (const cpu of ["arm64", "x64"]) {
+    const directory = path.join(root, optionalDirectory(cpu));
+    const bytes = await readFile(path.join(directory, "package.json"));
+    check(bytes.length <= 4096, "optional_resource_metadata_mismatch", "failed");
+    let metadata;
+    try { metadata = JSON.parse(bytes.toString("utf8")); }
+    catch { throw new VerificationFailure("failed", "optional_resource_metadata_mismatch"); }
+    resources.push({ cpu, metadata, metadataSha256: createHash("sha256").update(bytes).digest("hex"),
+      binarySha256: await sha256File(path.join(directory, "node.napi.glibc.node")) });
+  }
+  const loaders = {};
+  for (const filename of Object.keys(optionalLoaderPins)) {
+    loaders[filename] = createHash("sha256").update(await readAsarResource(path.join(root, "Contents/Resources/app.asar"), filename)).digest("hex");
+  }
+  validateMachOInventory({ arch, version, files: nativeFiles, resources, loaders });
+}
+
+const optionalDirectory = (cpu) => `Contents/Resources/app.asar.unpacked/node_modules/@msgpackr-extract/msgpackr-extract-darwin-${cpu}`;
+const optionalResourcePins = {
+  arm64: {
+    metadata: "115e306fbd59af670a4e85f5cc41900d90344211e65d6a91122c018132df48d6",
+    "1.0.8": { arm64: "f4f350b4fcbadd64759f639989e42de84cc099658f79817311fd11479810c56f", x64: "d916b8c89dcfb91d0fe66281a7b33fbe453b182eb6a4759b40aec0b3d4464450" },
+    "1.0.9": { arm64: "09faedccf609dde6fb72ca7d58a15e7e8d0baa3750a7bba26cf21e9119014745", x64: "c16822ba903aea8fa2d137573104f2bae2052b663f991324bac4f65c0d60e0d9" },
+  },
+  x64: {
+    metadata: "753a3d68c775279b70dd7b5dc7c6868f9832d4d2090a8d428c98342b99989483",
+    "1.0.8": { arm64: "5647133ba13f3046bd2fd4550f75a603e43f535c23f33d1bea0f011f4f1f8af9", x64: "b87080295249b4863652366929a54fa1d198058978a8414194e88d8ad843532f" },
+    "1.0.9": { arm64: "fc5e0de17cd6dd5ba7ce4043ee39ae9f3b278e7830d2d16e38aef51fc76a01e8", x64: "4ae10898c6468be2b2a59592541182bf28b7857404c02e64c92f53659a22d7ea" },
+  },
+};
+const optionalLoaderPins = {
+  "node_modules/msgpackr-extract/index.js": "a2b9244e83810de461c09f0cd3629899619bf145a40bc05af44553faf40b9ff5",
+  "node_modules/node-gyp-build-optional-packages/index.js": "a7ed0d5ae218a19bdbdf15a590d0893790ddf536313b66a787554693cfaae078",
+  "node_modules/node-gyp-build-optional-packages/node-gyp-build.js": "21145626bbb3122baf79f196087f05d6f1eeb7b9c65c037ced6940c5c6113440",
+};
+
+export function validateMachOInventory({ arch, version, files, resources, loaders }) {
+  check(["arm64", "x64"].includes(arch), "unsupported_architecture");
+  check(["1.0.8", "1.0.9"].includes(version), "optional_resource_version_unreviewed", "failed");
+  check(Array.isArray(files) && files.length > 1 && files.length <= 40000,
+    "bundle_native_code_missing", "failed");
+  const entries = new Map();
+  for (const file of files) {
+    check(typeof file.relativePath === "string" && !entries.has(file.relativePath), "bundle_native_code_missing", "failed");
+    entries.set(file.relativePath, file.slices);
+    const cpu = ["arm64", "x64"].find((item) => file.relativePath === `${optionalDirectory(item)}/node.napi.glibc.node`);
+    check(file.slices === ((cpu ?? arch) === "x64" ? "x86_64" : "arm64"), "bundle_architecture_mismatch", "failed");
+  }
+  check(entries.has("Contents/MacOS/Program AI Desktop"), "bundle_native_code_missing", "failed");
+  check(Array.isArray(resources) && resources.length === 2 && new Set(resources.map((item) => item.cpu)).size === 2,
+    "optional_resource_pair_missing", "failed");
+  // These are conditional third-party resources, not executable architecture
+  // acceptance: the reviewed loader selects os.arch()/os.platform() (its npm
+  // override variables are absent from applicationEnvironment). Both pinned
+  // packages must exist, and each must exactly match its declared thin CPU.
+  // No other opposite-architecture or universal binary is exempted. Native app
+  // execution still requires the independent guarded host/process checks.
+  for (const cpu of ["arm64", "x64"]) {
+    const resource = resources.find((item) => item.cpu === cpu);
+    const metadata = resource?.metadata;
+    check(entries.has(`${optionalDirectory(cpu)}/node.napi.glibc.node`) && resource,
+      "optional_resource_pair_missing", "failed");
+    check(metadata?.name === `@msgpackr-extract/msgpackr-extract-darwin-${cpu}` && metadata.version === "3.0.4" &&
+      Array.isArray(metadata.os) && metadata.os.length === 1 && metadata.os[0] === "darwin" &&
+      Array.isArray(metadata.cpu) && metadata.cpu.length === 1 && metadata.cpu[0] === cpu &&
+      resource.metadataSha256 === optionalResourcePins[cpu].metadata, "optional_resource_metadata_mismatch", "failed");
+    check(resource.binarySha256 === optionalResourcePins[cpu][version][arch], "optional_resource_hash_mismatch", "failed");
+  }
+  check(loaders && Object.keys(loaders).length === Object.keys(optionalLoaderPins).length &&
+    Object.entries(optionalLoaderPins).every(([name, hash]) => loaders[name] === hash), "optional_resource_loader_mismatch", "failed");
+  return true;
+}
+
+export async function readAsarResource(filename, resource) {
+  check(Object.hasOwn(optionalLoaderPins, resource), "optional_resource_loader_mismatch", "failed");
+  const file = await open(filename, "r");
+  try {
+    const size = (await file.stat()).size;
+    const prefix = Buffer.alloc(16);
+    check((await file.read(prefix, 0, 16, 0)).bytesRead === 16 && prefix.readUInt32LE(0) === 4,
+      "optional_resource_loader_mismatch", "failed");
+    const headerSize = prefix.readUInt32LE(4), jsonSize = prefix.readUInt32LE(12);
+    check(jsonSize > 0 && jsonSize <= 16 * 1024 * 1024 && headerSize >= jsonSize + 8 && 8 + headerSize <= size,
+      "optional_resource_loader_mismatch", "failed");
+    const bytes = Buffer.alloc(jsonSize);
+    check((await file.read(bytes, 0, jsonSize, 16)).bytesRead === jsonSize, "optional_resource_loader_mismatch", "failed");
+    let entry;
+    try { entry = JSON.parse(bytes.toString("utf8")); }
+    catch { throw new VerificationFailure("failed", "optional_resource_loader_mismatch"); }
+    for (const part of resource.split("/")) entry = entry?.files?.[part];
+    const offset = Number(entry?.offset);
+    check(entry && !entry.unpacked && !entry.link && Number.isSafeInteger(entry.size) && entry.size > 0 && entry.size <= 32768 &&
+      typeof entry.offset === "string" && /^\d+$/.test(entry.offset) && Number.isSafeInteger(offset) &&
+      offset >= 0 && 8 + headerSize + offset + entry.size <= size, "optional_resource_loader_mismatch", "failed");
+    const content = Buffer.alloc(entry.size);
+    check((await file.read(content, 0, content.length, 8 + headerSize + offset)).bytesRead === content.length,
+      "optional_resource_loader_mismatch", "failed");
+    return content;
+  } finally { await file.close(); }
 }
 
 export function parseUpdaterConfiguration(text) {
@@ -380,7 +478,7 @@ export async function verifyApp(appPath, { pins, arch, version = pins.version })
   await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app], { kind: "failed", code: "app_signature_invalid" });
   await run("/usr/sbin/spctl", ["--assess", "--type", "execute", app], { code: "app_gatekeeper_unverified" });
   await validateStaple(app);
-  await verifyMachOFiles(app, arch);
+  await verifyMachOFiles(app, arch, version);
   const updater = parseUpdaterConfiguration(await readFile(path.join(app, "Contents/Resources/app-update.yml"), "utf8"));
   return { version, cdhash, executable: path.join(app, "Contents/MacOS", info.CFBundleExecutable),
     asarSha256: await sha256File(path.join(app, "Contents/Resources/app.asar")), updater };
