@@ -74,6 +74,12 @@ test("install launch observations and phases are fixed, bounded and cannot carry
   failure(() => launchObservation({ ...input, pidCount: 123 }), "launch_observation_invalid");
   failure(() => receipt({ ...value, phase: "/private/path" }), "receipt_invalid");
   failure(() => receipt({ ...value, gui: { consoleUserIsRunner: "private-user", guiBootstrapAvailable: false, guiBootstrapExitCode: 113 } }), "receipt_invalid");
+  const direct = { ...input, launcherMode: "direct_vendor_browser", openStatus: "not_used", openExitCode: null,
+    processStatus: "spawned", processExitCode: null };
+  assert.equal(launchObservation(direct).launcherMode, "direct_vendor_browser");
+  assert.equal(receipt({ ...value, browserLaunch: direct }).browserLaunch.launcherMode, "direct_vendor_browser");
+  failure(() => launchObservation({ ...direct, context: "application" }), "launch_observation_invalid");
+  failure(() => launchObservation({ ...direct, openStatus: "succeeded" }), "launch_observation_invalid");
 });
 
 test("pure host policy admits native public ARM and Intel facts, not an emulation claim", () => {

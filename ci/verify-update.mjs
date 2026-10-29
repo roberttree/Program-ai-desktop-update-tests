@@ -81,9 +81,28 @@ export function validatePreservation(before, after) {
     after.signedOut === true;
 }
 
-export function syntheticShellCommand(marker) {
+export function syntheticShellCommand(marker, project) {
   check(/^Public native update canary [a-f0-9-]{36}\n$/.test(marker), "synthetic_marker_invalid");
-  return `printf '%s' '${marker}' > update-canary.txt`;
+  check(typeof project === "string" && /^\/Users\/runner\/(?:[A-Za-z0-9_-]+\/)*public-native-update-[A-Za-z0-9]{6}\/synthetic-project$/.test(project),
+    "synthetic_project_invalid");
+  // Keep the command itself newline-free. The shell API's JSON-quoted eval
+  // wrapper can turn embedded command LF into literal backslash+n; printf's
+  // explicit format escape produces the exact expected LF without that case.
+  return `/usr/bin/printf '%s\\n' '${marker.slice(0, -1)}' > '${project}/update-canary.txt'`;
+}
+
+export function shellSeedObservation(response, expected, actual) {
+  check(/^Public native update canary [a-f0-9-]{36}\n$/.test(expected), "synthetic_marker_invalid");
+  check(actual === undefined || typeof actual === "string" && Buffer.byteLength(actual) <= 4096, "shell_observation_invalid");
+  const parts = Array.isArray(response?.parts) && response.parts.length <= 16 ? response.parts.filter((part) => part.type === "tool") : [];
+  const state = parts.length === 1 ? parts[0].state : undefined;
+  const exit = state?.metadata?.exit ?? state?.metadata?.exitCode;
+  return { toolPartCount: parts.length, toolStatus: ["pending", "running", "completed", "error"].includes(state?.status) ? state.status : "unknown",
+    exitCode: Number.isInteger(exit) && exit >= 0 && exit <= 255 ? exit : null,
+    fileRead: typeof actual === "string", expectedBytes: Buffer.byteLength(expected), actualBytes: typeof actual === "string" ? Buffer.byteLength(actual) : null,
+    digestMatches: typeof actual === "string" && createHash("sha256").update(actual).digest("hex") === createHash("sha256").update(expected).digest("hex"),
+    actualEndsInLf: typeof actual === "string" && actual.endsWith("\n"),
+    literalBackslashNMatches: typeof actual === "string" && actual === expected.slice(0, -1) + "\\n" };
 }
 
 export function payloadChunk(chunk, scenario, alreadyChanged) {
@@ -333,10 +352,15 @@ async function seed(control, root) {
   const connection = await sidecar(control);
   const session = await localRequest(connection, "/session", project, { title });
   check(typeof session.id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(session.id), "saved_session_unverified");
-  await localRequest(connection, `/session/${session.id}/shell`, project,
-    { agent: "build", command: syntheticShellCommand(marker) });
+  const response = await localRequest(connection, `/session/${session.id}/shell`, project,
+    { agent: "build", command: syntheticShellCommand(marker, project) });
   const messages = messageIds(await localRequest(connection, `/session/${session.id}/message`, project));
-  check(await readFile(path.join(project, "update-canary.txt"), "utf8") === marker, "shell_marker_unverified");
+  const markerPath = path.join(project, "update-canary.txt");
+  const info = await stat(markerPath).catch(() => undefined);
+  const actual = info?.isFile() && info.size <= 4096 ? await readFile(markerPath, "utf8") : undefined;
+  const observed = shellSeedObservation(response, marker, actual);
+  console.log(JSON.stringify({ schemaVersion: 1, check: "shell_seed", ...observed }));
+  check(observed.toolStatus === "completed" && observed.digestMatches && (observed.exitCode === null || observed.exitCode === 0), "shell_marker_unverified");
   const store = JSON.stringify({ text: "Synthetic unsent canary; not an editor-draft claim", session: session.id, marker });
   await windowValue(control, `window.api.storeSet('public-native-verification.dat','unsent-canary',${JSON.stringify(store)})`);
   return { project, marker, title, session: session.id, messages, store, signedOut: true };
