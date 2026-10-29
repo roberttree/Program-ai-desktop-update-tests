@@ -310,11 +310,44 @@ export function signatureIdentity(text, pins, runtime = true) {
   return cdhash;
 }
 
+export function staplerObservation(result) {
+  const exitCode = Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255 ? result.exitCode : null;
+  const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.slice(0, 131072);
+  if (exitCode === 0) return { exitCode, category: "validated" };
+  if (/does not have a ticket stapled to it/i.test(text)) return { exitCode, category: "ticket_missing" };
+  // sysexits: invalid data, missing/invalid input, and revoked permission are
+  // never retried, even if a diagnostic also contains a network error string.
+  if ([65, 66, 77].includes(exitCode) || /ticket (?:has been )?revoked|ticket data is invalid/i.test(text))
+    return { exitCode, category: "ticket_rejected" };
+  // Only documented NSURL transport errors qualify. Exit 68 is ambiguous
+  // (unnotarized OR unexpected service response), not evidence of a network fault.
+  const errors = [...text.matchAll(/NSURLErrorDomain\s+Code\s*=\s*(-\d+)\b/g)];
+  if (!result.timedOut && errors.length > 0 && errors.every((match) => [-1001, -1003, -1004, -1005, -1006, -1009].includes(Number(match[1]))))
+    return { exitCode, category: "transient_network" };
+  return { exitCode, category: "unknown" };
+}
+
+export function staplerAction(observation, attempt) {
+  check(Number.isInteger(attempt) && attempt >= 1 && attempt <= 3 &&
+    ["validated", "ticket_missing", "ticket_rejected", "transient_network", "unknown"].includes(observation.category), "stapler_observation_invalid");
+  if (observation.category === "validated") return { done: true };
+  if (observation.category === "transient_network" && attempt < 3) return { retryAfterMs: attempt === 1 ? 2000 : 5000 };
+  const category = observation.category;
+  return { kind: ["ticket_missing", "ticket_rejected"].includes(category) ? "failed" : "unverified",
+    code: category === "ticket_missing" ? "stapled_ticket_missing" : category === "ticket_rejected" ? "ticket_validation_rejected" :
+      category === "transient_network" ? "ticket_network_unverified" : "ticket_validation_unverified" };
+}
+
 export async function validateStaple(filename) {
-  const result = await run("/usr/bin/xcrun", ["stapler", "validate", "-v", filename], { allowFailure: true });
-  if (result.exitCode === 0) return;
-  const missing = /does not have a ticket stapled to it/i.test(result.stdout + result.stderr);
-  throw new VerificationFailure(missing ? "failed" : "unverified", missing ? "stapled_ticket_missing" : "ticket_validation_unverified");
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const result = await run("/usr/bin/xcrun", ["stapler", "validate", "-v", filename], { allowFailure: true, maxBytes: 65536 });
+    const observation = staplerObservation(result);
+    console.log(JSON.stringify({ schemaVersion: 1, check: "stapler_validate", attempt, ...observation }));
+    const action = staplerAction(observation, attempt);
+    if (action.done) return;
+    if (!action.retryAfterMs) throw new VerificationFailure(action.kind, action.code);
+    await new Promise((resolve) => setTimeout(resolve, action.retryAfterMs));
+  }
 }
 
 async function verifyMachOFiles(app, arch, version) {
@@ -639,6 +672,18 @@ const receiptChecks = new Set([
   "renderer_ready", "signed_out", "local_typing", "update_download", "native_update", "state_preserved",
   "failure_rejected", "recovery_download", "cleanup",
 ]);
+const installPhases = new Set(["preflight", "zip_download", "zip_verify", "browser_preflight", "browser_launch", "browser_connect",
+  "browser_navigation", "browser_download", "dmg_verify", "dmg_mount", "mounted_verify", "finder_install", "installed_verify",
+  "application_launch", "renderer_connect", "sidecar_ready", "renderer_ready", "local_typing", "completed", "cleanup"]);
+
+export function launchObservation(value) {
+  check(value && ["browser", "application"].includes(value.context) && Number.isInteger(value.pidCount) && value.pidCount >= 0 && value.pidCount <= 2 &&
+    ["not_checked", "ready", "unverified"].includes(value.listener) && ["pending", "succeeded", "failed"].includes(value.openStatus) &&
+    (value.openExitCode === null || Number.isInteger(value.openExitCode) && value.openExitCode >= 0 && value.openExitCode <= 255) &&
+    typeof value.dialogApproved === "boolean" && typeof value.openTimedOut === "boolean", "launch_observation_invalid");
+  return { context: value.context, pidCount: value.pidCount, listener: value.listener,
+    openStatus: value.openStatus, openExitCode: value.openExitCode, openTimedOut: value.openTimedOut, dialogApproved: value.dialogApproved };
+}
 
 export function receipt(value) {
   check(["install", "update"].includes(value.flow) && ["arm64", "x64"].includes(value.arch) &&
@@ -647,6 +692,16 @@ export function receipt(value) {
   const result = { schemaVersion: 1, flow: value.flow, arch: value.arch, version: value.version,
     status: value.status, checks: [...new Set(value.checks)], buildAttestation: false, providerGeneration: false };
   if (value.code) { check(/^[a-z][a-z0-9_]{0,63}$/.test(value.code), "receipt_invalid"); result.code = value.code; }
+  if (value.phase !== undefined) {
+    check(value.flow === "install" && installPhases.has(value.phase), "receipt_invalid"); result.phase = value.phase;
+  }
+  if (value.launch !== undefined) { check(value.flow === "install", "receipt_invalid"); result.launch = launchObservation(value.launch); }
+  if (value.gui !== undefined) {
+    check(value.flow === "install" && typeof value.gui.consoleUserIsRunner === "boolean" && typeof value.gui.guiBootstrapAvailable === "boolean" &&
+      (value.gui.guiBootstrapExitCode === null || Number.isInteger(value.gui.guiBootstrapExitCode) && value.gui.guiBootstrapExitCode >= 0 && value.gui.guiBootstrapExitCode <= 255), "receipt_invalid");
+    result.gui = { consoleUserIsRunner: value.gui.consoleUserIsRunner, guiBootstrapAvailable: value.gui.guiBootstrapAvailable,
+      guiBootstrapExitCode: value.gui.guiBootstrapExitCode };
+  }
   return result;
 }
 

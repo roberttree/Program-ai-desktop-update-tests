@@ -2,13 +2,63 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
-  SCENARIOS, byteRange, caseReceipt, loopbackUrl, metadata, parseScenario,
+  SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
   payloadChunk, rejectionOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
 
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
 const state = () => ({ marker: "synthetic\n", store: "unsent canary", session: "session_synthetic_1",
   title: "Synthetic shell chat", messages: ["message_1", "message_2"], signedOut: true });
+
+test("paused evaluation uses only the observed call frame and rejects asynchronous or exceptional results", async () => {
+  assert.equal(pausedCallFrame({ callFrames: [{ callFrameId: "owned-frame" }] }), "owned-frame");
+  for (const event of [{}, { callFrames: [] }, { callFrames: [{ callFrameId: "" }] }, { callFrames: [{ callFrameId: "x".repeat(1025) }] }])
+    assert.equal(pausedCallFrame(event), undefined);
+  const calls = [];
+  const main = { send: async (...args) => { calls.push(args); return { result: { type: "boolean", value: true } }; } };
+  assert.equal(await evaluatePaused(main, "owned-frame", "true"), true);
+  assert.equal(calls[0][0], "Debugger.evaluateOnCallFrame");
+  assert.deepEqual(calls[0][1], { callFrameId: "owned-frame", expression: "true", returnByValue: true, silent: true });
+  assert.equal(calls[0][2], 20000);
+  assert.equal(Object.hasOwn(calls[0][1], "awaitPromise"), false);
+  for (const result of [{ exceptionDetails: {} }, { result: { type: "object", subtype: "promise" } }, { result: { type: "boolean", value: false } }])
+    await assert.rejects(evaluatePaused({ send: async () => result }, "owned-frame", "true"), { code: "paused_evaluation_unverified" });
+});
+
+function bootstrapFixture(failMethod) {
+  let paused;
+  const calls = [], phases = [];
+  return { calls, phases, client: {
+    onEvent(method, callback) { assert.equal(method, "Debugger.paused"); paused = callback; return () => { paused = undefined; }; },
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === failMethod) throw Object.assign(new Error("fixture only"), { code: "diagnostic_command_timeout" });
+      if (method === "Runtime.runIfWaitingForDebugger") paused({ callFrames: [{ callFrameId: "owned-frame" }] });
+      return { result: { type: "boolean", value: true } };
+    },
+  }, observe: (phase) => phases.push(phase) };
+}
+
+test("actual bootstrap attests and sets loopback synchronously before resume, with fixed command subphases", async () => {
+  const fixture = bootstrapFixture();
+  await bootstrapMain(fixture.client, {}, "http://127.0.0.1:1234/", fixture.observe);
+  assert.deepEqual(fixture.calls.map((call) => call.method), ["Debugger.enable", "Runtime.runIfWaitingForDebugger",
+    "Debugger.evaluateOnCallFrame", "Debugger.evaluateOnCallFrame", "Debugger.resume", "Debugger.disable"]);
+  assert.deepEqual(fixture.phases, ["base_debugger_enable", "base_waiting_release", "base_pause_wait", "base_attest",
+    "base_feed", "base_debugger_resume", "base_debugger_disable"]);
+  assert.match(fixture.calls[3].params.expression, /setFeedURL/);
+  assert.equal(fixture.calls[2].params.callFrameId, fixture.calls[3].params.callFrameId);
+  for (const phase of fixture.phases) assert.equal(caseReceipt({ scenario: "positive", arch: "x64", version: "1.0.9", status: "unverified", phase }).phase, phase);
+});
+
+test("bootstrap failures retain the exact fixed failing command phase instead of claiming a debugger cause", async () => {
+  for (const [method, phase] of [["Debugger.enable", "base_debugger_enable"], ["Runtime.runIfWaitingForDebugger", "base_waiting_release"],
+    ["Debugger.evaluateOnCallFrame", "base_attest"], ["Debugger.resume", "base_debugger_resume"], ["Debugger.disable", "base_debugger_disable"]]) {
+    const fixture = bootstrapFixture(method);
+    await assert.rejects(bootstrapMain(fixture.client, {}, "http://127.0.0.1:1234/", fixture.observe), { code: "diagnostic_command_timeout" });
+    assert.equal(fixture.phases.at(-1), phase);
+  }
+});
 
 test("live scenario is explicit and restricted to approved cases", () => {
   for (const scenario of SCENARIOS) assert.equal(parseScenario(["--scenario", scenario]), scenario);
@@ -147,8 +197,9 @@ test("live entrypoint remains CI-gated and never uses source imports, global kil
   assert.match(source, /await preserved\(control, before\)/);
   assert.match(source, /updated\.installed\.cdhash === candidate\.cdhash/);
   assert.match(source, /signature-verification-only-never-launch/);
-  const bootstrap = source.slice(source.indexOf("async function startBase("), source.indexOf("async function windowValue("));
+  const bootstrap = source.slice(source.indexOf("export async function bootstrapMain("), source.indexOf("async function startBase("));
   assert.ok(bootstrap.indexOf("mainExpression(changeFeed, expected, feedUrl)") < bootstrap.indexOf('main.send("Debugger.resume")'));
+  assert.doesNotMatch(bootstrap, /await evaluate\(main|awaitPromise/);
   assert.match(source, /feed\.select\("baseline"\)/);
   assert.match(source, /baselineTraffic\.zip === 0/);
   assert.doesNotMatch(source, /console\.(?:error|log)\(error|JSON\.stringify\(connection|Authorization.*console/);

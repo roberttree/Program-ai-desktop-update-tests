@@ -4,7 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   VerificationFailure, applicationEnvironment, approvedRedirect, assertAbsent, check, connectCdp, connectWebSocket, downloadPinned,
-  emitReceipt, ensureFreshHost, extractZip, findOwnedPids, loadPins, loopbackWebSocket,
+  emitReceipt, ensureFreshHost, extractZip, findOwnedPids, launchObservation, loadPins, loopbackWebSocket,
   quarantineRecord, requireCiContext, run, sha256File, terminateOwned, unusedPort, verifyApp, verifyDmg, verifyListener, waitFor,
 } from "./runtime.mjs";
 
@@ -56,30 +56,70 @@ async function approveNormalOpen(application) {
   return result.exitCode === 0 && result.stdout.trim() === "true";
 }
 
-async function ownedDiagnosticPort(executable, port, application) {
-  return waitFor(async () => {
-    const pids = await findOwnedPids(executable);
-    if (pids.length !== 1) { await approveNormalOpen(application); return false; }
-    await verifyListener(port, pids[0], executable);
-    return pids[0];
-  }, { timeoutMs: 90000, code: "normal_native_launch_unverified" });
+export function launchFailureCode(value) {
+  const observation = launchObservation(value);
+  const suffix = observation.openStatus === "failed" ? "open_failed" : observation.pidCount === 0 ? "process_missing" :
+    observation.pidCount > 1 ? "process_ambiguous" : "listener_unverified";
+  return `${observation.context}_${suffix}`;
 }
 
-async function browserDownload(root, downloads, artifact, onLaunch) {
+async function ownedDiagnosticPort(executable, port, application, observation, observe) {
+  try {
+    return await waitFor(async () => {
+      const pids = await findOwnedPids(executable);
+      observation.pidCount = Math.min(pids.length, 2);
+      if (pids.length !== 1) {
+        observation.listener = "not_checked";
+        observation.dialogApproved = await approveNormalOpen(application) || observation.dialogApproved;
+        observe(observation); return false;
+      }
+      observation.listener = "unverified"; observe(observation);
+      await verifyListener(port, pids[0], executable);
+      observation.listener = "ready"; observe(observation);
+      return pids[0];
+    }, { timeoutMs: 90000, code: "normal_native_launch_unverified" });
+  } catch (error) {
+    if (error instanceof VerificationFailure && error.kind === "failed") throw error;
+    throw new VerificationFailure("unverified", launchFailureCode(observation));
+  }
+}
+
+function opening(result, observation, observe) {
+  observation.openStatus = result.exitCode === 0 ? "succeeded" : "failed";
+  observation.openExitCode = Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255 ? result.exitCode : null;
+  observation.openTimedOut = result.timedOut === true;
+  observe(observation);
+  return result.exitCode === 0;
+}
+
+async function browserDownload(root, downloads, artifact, onLaunch, observePhase, observeLaunch, observeGui) {
+  observePhase("browser_preflight");
   const info = JSON.parse((await run("/usr/bin/plutil", ["-convert", "json", "-o", "-", `${CHROME}/Contents/Info.plist`])).stdout);
   check(info.CFBundleIdentifier === "com.google.Chrome" && info.LSFileQuarantineEnabled === true,
     "browser_quarantine_capability_unverified");
   await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", CHROME], { code: "browser_signature_unverified" });
   await run("/usr/sbin/spctl", ["--assess", "--type", "execute", CHROME], { code: "browser_trust_unverified" });
   check((await findOwnedPids(CHROME_EXECUTABLE)).length === 0, "preexisting_browser_process");
+  // Read-only capability facts on the guarded disposable CI host. No GUI/TCC
+  // settings are changed, and no process identifiers or command output escape.
+  const consoleUser = await run("/usr/bin/stat", ["-f", "%Su", "/dev/console"], { allowFailure: true, timeoutMs: 10000, maxBytes: 4096 });
+  const gui = await run("/bin/launchctl", ["print", `gui/${process.getuid()}`], { allowFailure: true, timeoutMs: 10000, maxBytes: 4 * 1024 * 1024 });
+  observeGui({ consoleUserIsRunner: consoleUser.exitCode === 0 && consoleUser.stdout.trim() === "runner",
+    guiBootstrapAvailable: gui.exitCode === 0,
+    guiBootstrapExitCode: Number.isInteger(gui.exitCode) && gui.exitCode >= 0 && gui.exitCode <= 255 ? gui.exitCode : null });
   const port = await unusedPort();
   const started = Date.now();
+  const observation = { context: "browser", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
+    openTimedOut: false, dialogApproved: false };
+  observePhase("browser_launch"); observeLaunch(observation);
   onLaunch();
   const launched = run("/usr/bin/open", ["-n", "-a", CHROME, "--args", `--user-data-dir=${path.join(root, "browser-profile")}`,
     `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check", "about:blank"],
-    { env: applicationEnvironment(), code: "headed_browser_launch_unverified" }).then(() => true, () => false);
-  const pid = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome");
+    { env: applicationEnvironment(), code: "headed_browser_launch_unverified", allowFailure: true })
+    .then((result) => opening(result, observation, observeLaunch), () => opening({ exitCode: null, timedOut: false }, observation, observeLaunch));
+  const pid = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome", observation, observeLaunch);
   check(await launched, "headed_browser_launch_unverified");
+  observePhase("browser_connect");
   const page = await connectCdp(port, pid, { executable: CHROME_EXECUTABLE });
   const version = await fetch(`http://127.0.0.1:${port}/json/version`, { redirect: "error", signal: AbortSignal.timeout(5000) });
   const metadata = await version.json();
@@ -97,12 +137,14 @@ async function browserDownload(root, downloads, artifact, onLaunch) {
     await page.send("Page.enable");
     const url = new URL(artifact.url);
     const release = url.pathname.replace(/\/download\//, "/expanded_assets/").replace(/\/[^/]+$/, "");
+    observePhase("browser_navigation");
     await page.send("Page.navigate", { url: `https://github.com${release}` });
     await waitFor(async () => page.evaluate(`(() => {
       const items = Array.from(document.querySelectorAll('a[href]')).filter(a => a.getAttribute('href') === ${JSON.stringify(url.pathname)});
       if (items.length !== 1) return false;
       items[0].click(); return true;
     })()`), { timeoutMs: 60000, code: "browser_asset_link_unverified" });
+    observePhase("browser_download");
     await waitFor(() => completed && begun, { timeoutMs: 10 * 60 * 1000, code: "browser_download_unverified" });
     const original = path.join(downloads, begun.guid);
     check((await realpath(original)) === original, "browser_download_path_invalid");
@@ -138,7 +180,9 @@ export function firstLaunchObservation({ document: doc = document, getComputedSt
 
 export async function verifyInstall() {
   const pins = await loadPins();
-  const record = { flow: "install", arch: process.env.VERIFY_ARCH, version: pins.version, status: "unverified", checks: [] };
+  const record = { flow: "install", arch: process.env.VERIFY_ARCH, version: pins.version, status: "unverified", checks: [], phase: "preflight" };
+  const observePhase = (phase) => { record.phase = phase; };
+  const observeLaunch = (value) => { record.launch = launchObservation(value); };
   let root, mount, mounted = false, appPid, chromePid, renderer;
   let chromeLaunchAttempted = false, appLaunchAttempted = false;
   let guarded = false;
@@ -155,32 +199,40 @@ export async function verifyInstall() {
       "runner_temporary_unverified");
     root = await mkdtemp(path.join(runnerTemp, "program-ai-install-"));
     const artifact = pins.artifacts[context.arch];
+    observePhase("zip_download");
     const zip = await downloadPinned(artifact.zip, path.join(root, artifact.zip.name));
     record.checks.push("zip_bytes");
     const zipApp = await extractZip(zip, path.join(root, "zip-preflight"));
+    observePhase("zip_verify");
     const expected = await verifyApp(zipApp, { pins, arch: context.arch });
     record.checks.push("zip_app_signature", "zip_app_ticket");
     // Current ZIP-contained app trust is established before any browser launch.
     await mkdir(path.join(homedir(), "Downloads"), { recursive: true });
     const downloads = await realpath(await mkdtemp(path.join(homedir(), "Downloads/program-ai-verification-")));
-    const downloaded = await browserDownload(root, downloads, artifact.dmg, () => { chromeLaunchAttempted = true; });
+    const downloaded = await browserDownload(root, downloads, artifact.dmg, () => { chromeLaunchAttempted = true; },
+      observePhase, observeLaunch, (gui) => { record.gui = gui; });
     chromePid = downloaded.pid;
     record.checks.push("headed_browser_download", "genuine_quarantine", "dmg_bytes");
+    observePhase("dmg_verify");
     await verifyDmg(downloaded.dmg, { pins });
     record.checks.push("dmg_signature", "dmg_ticket");
     mount = path.join(root, "mounted-dmg");
     await mkdir(mount);
+    observePhase("dmg_mount");
     await run("/usr/bin/hdiutil", ["attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", mount, downloaded.dmg]);
     mounted = true;
     const sourceApp = path.join(mount, "Program AI Desktop.app");
+    observePhase("mounted_verify");
     const mountedIdentity = await verifyApp(sourceApp, { pins, arch: context.arch });
     check(mountedIdentity.cdhash === expected.cdhash && mountedIdentity.asarSha256 === expected.asarSha256,
       "zip_dmg_app_mismatch", "failed");
     await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", sourceApp], { code: "mounted_quarantine_unverified" });
     record.checks.push("mounted_app");
     await assertAbsent(INSTALLED_APP);
+    observePhase("finder_install");
     await run("/usr/bin/osascript", ["-e", `tell application "Finder" to duplicate POSIX file ${JSON.stringify(sourceApp)} to POSIX file "/Applications"`],
       { env: applicationEnvironment(), code: "finder_install_unverified" });
+    observePhase("installed_verify");
     const installed = await verifyApp(INSTALLED_APP, { pins, arch: context.arch });
     check(installed.cdhash === expected.cdhash && installed.asarSha256 === expected.asarSha256,
       "finder_installed_app_mismatch", "failed");
@@ -188,14 +240,20 @@ export async function verifyInstall() {
     record.checks.push("finder_install");
     await run("/usr/bin/hdiutil", ["detach", mount]); mounted = false;
     const port = await unusedPort();
+    const observation = { context: "application", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
+      openTimedOut: false, dialogApproved: false };
+    observePhase("application_launch"); observeLaunch(observation);
     appLaunchAttempted = true;
     const launched = run("/usr/bin/open", ["-n", "-a", INSTALLED_APP, "--args", `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"],
-      { env: applicationEnvironment(), code: "native_first_launch_unverified" }).then(() => true, () => false);
-    appPid = await ownedDiagnosticPort(installed.executable, port, "Program AI Desktop");
+      { env: applicationEnvironment(), code: "native_first_launch_unverified", allowFailure: true })
+      .then((result) => opening(result, observation, observeLaunch), () => opening({ exitCode: null, timedOut: false }, observation, observeLaunch));
+    appPid = await ownedDiagnosticPort(installed.executable, port, "Program AI Desktop", observation, observeLaunch);
     check(await launched, "native_first_launch_unverified");
     record.checks.push("native_launch");
+    observePhase("renderer_connect");
     renderer = await connectCdp(port, appPid, { executable: installed.executable });
     await waitFor(() => renderer.evaluate("!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "preload_readiness_unverified" });
+    observePhase("sidecar_ready");
     const sidecar = await renderer.evaluate(`(async () => {
       const server = await window.api.awaitInitialization();
       const url = new URL(server.url);
@@ -206,11 +264,13 @@ export async function verifyInstall() {
     })()`, 90000);
     check(sidecar === true, "native_sidecar_health_failed", "failed");
     record.checks.push("sidecar_ready");
+    observePhase("renderer_ready");
     await waitFor(() => renderer.evaluate(`(${firstLaunchObservation.toString()})()`), { timeoutMs: 90000, code: "native_renderer_readiness_unverified" });
     record.checks.push("renderer_ready");
     check(await renderer.evaluate("window.api.programAICloudAuth.getState().then(value => value.status === 'signed_out')") === true,
       "fresh_account_state_unverified");
     record.checks.push("signed_out");
+    observePhase("local_typing");
     const typed = await renderer.evaluate(`(() => {
       const element = Array.from(document.querySelectorAll('textarea[aria-label="Prompt"], [data-component="prompt-input"][contenteditable="true"]')).find(node=>node.getBoundingClientRect().height>0);
       if (!element) return false;
@@ -226,6 +286,7 @@ export async function verifyInstall() {
     record.checks.push("local_typing");
     check((await run("/usr/sbin/spctl", ["--status"])).stdout.includes("assessments enabled"), "gatekeeper_state_changed");
     record.status = "passed";
+    observePhase("completed");
   } catch (error) {
     record.status = error instanceof VerificationFailure ? error.kind : "unverified";
     record.code = error instanceof VerificationFailure ? error.code : "unexpected_verification_failure";
@@ -246,7 +307,7 @@ export async function verifyInstall() {
         if (mounted) await run("/usr/bin/hdiutil", ["detach", mount]);
         record.checks.push("cleanup");
       } catch {
-        record.status = "unverified"; record.code = "owned_cleanup_unverified";
+        record.status = "unverified"; record.code = "owned_cleanup_unverified"; observePhase("cleanup");
       }
     }
     // Never emit raw exceptions, native command output, browser URLs, tokens,
