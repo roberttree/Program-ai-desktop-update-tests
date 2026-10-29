@@ -1,0 +1,90 @@
+name: Verify signed Mac binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: One-off native binary verification suite
+        type: choice
+        required: true
+        default: install-and-update
+        options:
+          - install-and-update
+          - update-failures
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-mac-binary-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main' && inputs.suite == 'install-and-update'
+    name: ${{ matrix.arch }} ${{ matrix.check }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      VERIFY_ARCH: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            check: install
+          - arch: x64
+            runner: macos-15-intel
+            check: install
+          - arch: arm64
+            runner: macos-15
+            check: update
+          - arch: x64
+            runner: macos-15-intel
+            check: update
+    steps:
+      - name: Read the reviewed verification source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify the test driver without running applications
+        run: node --test ci/*.test.mjs
+      - name: Verify the signed installer on a native Mac
+        if: matrix.check == 'install'
+        run: node ci/verify-install.mjs --arch ${{ matrix.arch }}
+      - name: Verify the real signed update and failure behavior
+        if: matrix.check == 'update'
+        run: node ci/verify-update.mjs --scenario positive
+
+  update-failures:
+    if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main' && inputs.suite == 'update-failures'
+    name: ${{ matrix.target.arch }} ${{ matrix.scenario }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 35
+    env:
+      VERIFY_ARCH: ${{ matrix.target.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+        scenario:
+          - offline
+          - unavailable
+          - interrupted
+          - checksum
+          - downgrade
+          - signature
+    steps:
+      - name: Read the reviewed verification source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify the test driver without running applications
+        run: node --test ci/*.test.mjs
+      - name: Verify rejection, preserved state, and recovery on a fresh Mac
+        run: node ci/verify-update.mjs --scenario ${{ matrix.scenario }}
