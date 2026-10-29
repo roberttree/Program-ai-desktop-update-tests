@@ -677,11 +677,19 @@ const installPhases = new Set(["preflight", "zip_download", "zip_verify", "brows
   "application_launch", "renderer_connect", "sidecar_ready", "renderer_ready", "local_typing", "completed", "cleanup"]);
 
 export function launchObservation(value) {
+  const launcherMode = value?.launcherMode ?? "launch_services";
   check(value && ["browser", "application"].includes(value.context) && Number.isInteger(value.pidCount) && value.pidCount >= 0 && value.pidCount <= 2 &&
-    ["not_checked", "ready", "unverified"].includes(value.listener) && ["pending", "succeeded", "failed"].includes(value.openStatus) &&
+    ["not_checked", "ready", "unverified"].includes(value.listener) && ["pending", "succeeded", "failed", "not_used"].includes(value.openStatus) &&
     (value.openExitCode === null || Number.isInteger(value.openExitCode) && value.openExitCode >= 0 && value.openExitCode <= 255) &&
-    typeof value.dialogApproved === "boolean" && typeof value.openTimedOut === "boolean", "launch_observation_invalid");
-  return { context: value.context, pidCount: value.pidCount, listener: value.listener,
+    typeof value.dialogApproved === "boolean" && typeof value.openTimedOut === "boolean" &&
+    ["launch_services", "direct_vendor_browser"].includes(launcherMode) &&
+    (value.context !== "application" || launcherMode === "launch_services") &&
+    (launcherMode === "direct_vendor_browser" ? value.context === "browser" && value.openStatus === "not_used" &&
+      ["pending", "spawned", "exited", "error"].includes(value.processStatus) &&
+      (value.processExitCode === null || Number.isInteger(value.processExitCode) && value.processExitCode >= 0 && value.processExitCode <= 255) :
+      value.openStatus !== "not_used"), "launch_observation_invalid");
+  return { context: value.context, launcherMode, pidCount: value.pidCount, listener: value.listener,
+    ...(launcherMode === "direct_vendor_browser" ? { processStatus: value.processStatus, processExitCode: value.processExitCode } : {}),
     openStatus: value.openStatus, openExitCode: value.openExitCode, openTimedOut: value.openTimedOut, dialogApproved: value.dialogApproved };
 }
 
@@ -696,6 +704,10 @@ export function receipt(value) {
     check(value.flow === "install" && installPhases.has(value.phase), "receipt_invalid"); result.phase = value.phase;
   }
   if (value.launch !== undefined) { check(value.flow === "install", "receipt_invalid"); result.launch = launchObservation(value.launch); }
+  if (value.browserLaunch !== undefined) {
+    check(value.flow === "install" && value.browserLaunch.context === "browser", "receipt_invalid");
+    result.browserLaunch = launchObservation(value.browserLaunch);
+  }
   if (value.gui !== undefined) {
     check(value.flow === "install" && typeof value.gui.consoleUserIsRunner === "boolean" && typeof value.gui.guiBootstrapAvailable === "boolean" &&
       (value.gui.guiBootstrapExitCode === null || Number.isInteger(value.gui.guiBootstrapExitCode) && value.gui.guiBootstrapExitCode >= 0 && value.gui.guiBootstrapExitCode <= 255), "receipt_invalid");

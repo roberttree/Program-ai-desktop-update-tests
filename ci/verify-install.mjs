@@ -1,4 +1,5 @@
 import { lstat, mkdir, mkdtemp, realpath, rename } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -58,7 +59,8 @@ async function approveNormalOpen(application) {
 
 export function launchFailureCode(value) {
   const observation = launchObservation(value);
-  const suffix = observation.openStatus === "failed" ? "open_failed" : observation.pidCount === 0 ? "process_missing" :
+  const suffix = observation.processStatus === "error" ? "spawn_failed" : observation.processStatus === "exited" ? "process_exited" :
+    observation.openStatus === "failed" ? "open_failed" : observation.pidCount === 0 ? "process_missing" :
     observation.pidCount > 1 ? "process_ambiguous" : "listener_unverified";
   return `${observation.context}_${suffix}`;
 }
@@ -92,6 +94,32 @@ function opening(result, observation, observe) {
   return result.exitCode === 0;
 }
 
+export function chromeLaunchArguments(profile, port) {
+  check(path.isAbsolute(profile) && Number.isInteger(port) && port > 0 && port < 65536, "browser_arguments_invalid");
+  return [`--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1",
+    "--no-first-run", "--no-default-browser-check", "about:blank"];
+}
+
+function startHeadfulChrome(profile, port, observation, observe) {
+  // Only the preflight-verified official browser is directly spawned. No
+  // headless/security switches or application-launch shortcuts are introduced.
+  const child = spawn(CHROME_EXECUTABLE, chromeLaunchArguments(profile, port), {
+    env: applicationEnvironment(), stdio: ["ignore", "ignore", "ignore"],
+  });
+  let exited;
+  const stopped = new Promise((resolve) => { exited = resolve; });
+  const started = new Promise((resolve) => {
+    child.once("spawn", () => { observation.processStatus = "spawned"; observe(observation); resolve(true); });
+    child.once("error", () => { observation.processStatus = "error"; observe(observation); resolve(false); exited(); });
+  });
+  child.once("exit", (code) => {
+    observation.processStatus = "exited";
+    observation.processExitCode = Number.isInteger(code) && code >= 0 && code <= 255 ? code : null;
+    observe(observation); exited();
+  });
+  return { child, started, stopped };
+}
+
 async function browserDownload(root, downloads, artifact, onLaunch, observePhase, observeLaunch, observeGui) {
   observePhase("browser_preflight");
   const info = JSON.parse((await run("/usr/bin/plutil", ["-convert", "json", "-o", "-", `${CHROME}/Contents/Info.plist`])).stdout);
@@ -109,16 +137,14 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
     guiBootstrapExitCode: Number.isInteger(gui.exitCode) && gui.exitCode >= 0 && gui.exitCode <= 255 ? gui.exitCode : null });
   const port = await unusedPort();
   const started = Date.now();
-  const observation = { context: "browser", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
-    openTimedOut: false, dialogApproved: false };
+  const observation = { context: "browser", launcherMode: "direct_vendor_browser", pidCount: 0, listener: "not_checked",
+    openStatus: "not_used", openExitCode: null, openTimedOut: false, dialogApproved: false, processStatus: "pending", processExitCode: null };
   observePhase("browser_launch"); observeLaunch(observation);
-  onLaunch();
-  const launched = run("/usr/bin/open", ["-n", "-a", CHROME, "--args", `--user-data-dir=${path.join(root, "browser-profile")}`,
-    `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check", "about:blank"],
-    { env: applicationEnvironment(), code: "headed_browser_launch_unverified", allowFailure: true })
-    .then((result) => opening(result, observation, observeLaunch), () => opening({ exitCode: null, timedOut: false }, observation, observeLaunch));
+  const launcher = startHeadfulChrome(path.join(root, "browser-profile"), port, observation, observeLaunch);
+  onLaunch(launcher);
+  check(await launcher.started, "headed_browser_spawn_unverified");
   const pid = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome", observation, observeLaunch);
-  check(await launched, "headed_browser_launch_unverified");
+  check(pid === launcher.child.pid, "browser_process_owner_unverified");
   observePhase("browser_connect");
   const page = await connectCdp(port, pid, { executable: CHROME_EXECUTABLE });
   const version = await fetch(`http://127.0.0.1:${port}/json/version`, { redirect: "error", signal: AbortSignal.timeout(5000) });
@@ -182,8 +208,12 @@ export async function verifyInstall() {
   const pins = await loadPins();
   const record = { flow: "install", arch: process.env.VERIFY_ARCH, version: pins.version, status: "unverified", checks: [], phase: "preflight" };
   const observePhase = (phase) => { record.phase = phase; };
-  const observeLaunch = (value) => { record.launch = launchObservation(value); };
-  let root, mount, mounted = false, appPid, chromePid, renderer;
+  const observeLaunch = (value) => {
+    const observation = launchObservation(value);
+    if (observation.context === "browser") record.browserLaunch = observation;
+    if (record.launch?.context !== "application" || observation.context === "application") record.launch = observation;
+  };
+  let root, mount, mounted = false, appPid, chromePid, renderer, browserStarted, browserStopped, applicationStarted;
   let chromeLaunchAttempted = false, appLaunchAttempted = false;
   let guarded = false;
   try {
@@ -209,7 +239,9 @@ export async function verifyInstall() {
     // Current ZIP-contained app trust is established before any browser launch.
     await mkdir(path.join(homedir(), "Downloads"), { recursive: true });
     const downloads = await realpath(await mkdtemp(path.join(homedir(), "Downloads/program-ai-verification-")));
-    const downloaded = await browserDownload(root, downloads, artifact.dmg, () => { chromeLaunchAttempted = true; },
+    const downloaded = await browserDownload(root, downloads, artifact.dmg, (launcher) => {
+      chromeLaunchAttempted = true; browserStarted = launcher.started; browserStopped = launcher.stopped; chromePid = launcher.child.pid;
+    },
       observePhase, observeLaunch, (gui) => { record.gui = gui; });
     chromePid = downloaded.pid;
     record.checks.push("headed_browser_download", "genuine_quarantine", "dmg_bytes");
@@ -240,13 +272,14 @@ export async function verifyInstall() {
     record.checks.push("finder_install");
     await run("/usr/bin/hdiutil", ["detach", mount]); mounted = false;
     const port = await unusedPort();
-    const observation = { context: "application", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
+    const observation = { context: "application", launcherMode: "launch_services", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
       openTimedOut: false, dialogApproved: false };
     observePhase("application_launch"); observeLaunch(observation);
     appLaunchAttempted = true;
     const launched = run("/usr/bin/open", ["-n", "-a", INSTALLED_APP, "--args", `--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"],
       { env: applicationEnvironment(), code: "native_first_launch_unverified", allowFailure: true })
       .then((result) => opening(result, observation, observeLaunch), () => opening({ exitCode: null, timedOut: false }, observation, observeLaunch));
+    applicationStarted = launched;
     appPid = await ownedDiagnosticPort(installed.executable, port, "Program AI Desktop", observation, observeLaunch);
     check(await launched, "native_first_launch_unverified");
     record.checks.push("native_launch");
@@ -294,6 +327,10 @@ export async function verifyInstall() {
     renderer?.close();
     if (guarded) {
       try {
+        // Settle owned launch attempts before inspecting/terminating their
+        // exact processes, so no delayed launcher can start after cleanup.
+        await browserStarted;
+        await applicationStarted;
         if (!appPid && appLaunchAttempted) {
           const pids = await findOwnedPids(`${INSTALLED_APP}/Contents/MacOS/Program AI Desktop`);
           if (pids.length === 1) appPid = pids[0];
@@ -304,6 +341,7 @@ export async function verifyInstall() {
           if (pids.length === 1) chromePid = pids[0];
         }
         if (chromePid) await terminateOwned(CHROME_EXECUTABLE, chromePid);
+        await browserStopped;
         if (mounted) await run("/usr/bin/hdiutil", ["detach", mount]);
         record.checks.push("cleanup");
       } catch {

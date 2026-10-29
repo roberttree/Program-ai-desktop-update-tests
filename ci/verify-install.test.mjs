@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { firstLaunchObservation, launchFailureCode, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+import { chromeLaunchArguments, firstLaunchObservation, launchFailureCode, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+
+test("verified vendor browser arguments remain headful, loopback-only and contain no security bypass flags", () => {
+  assert.deepEqual(chromeLaunchArguments("/Users/runner/work/_temp/owned/browser-profile", 1234), [
+    "--user-data-dir=/Users/runner/work/_temp/owned/browser-profile", "--remote-debugging-port=1234", "--remote-debugging-address=127.0.0.1",
+    "--no-first-run", "--no-default-browser-check", "about:blank",
+  ]);
+  for (const port of [0, 65536, 1.5]) assert.throws(() => chromeLaunchArguments("/Users/runner/owned", port), { code: "browser_arguments_invalid" });
+  assert.throws(() => chromeLaunchArguments("relative", 1234), { code: "browser_arguments_invalid" });
+});
 
 test("launch capability failures distinguish exact-owner PID, listener and open outcomes without calling them app failures", () => {
   const value = { context: "browser", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
@@ -69,7 +78,16 @@ test("the actual driver guards first, proves ZIP app trust before Chrome, and ne
   assert.match(source, /allowFailure: true/);
   assert.match(source, /observePhase\("browser_launch"\)/);
   assert.match(source, /observePhase\("application_launch"\)/);
-  assert.doesNotMatch(source, /spawn\(|execFile\(/); // Application first launch remains LaunchServices.
+  assert.match(source, /spawn\(CHROME_EXECUTABLE/);
+  assert.doesNotMatch(flow, /spawn\(|execFile\(/); // Application first launch remains LaunchServices.
+  assert.match(flow, /run\("\/usr\/bin\/open", \["-n", "-a", INSTALLED_APP/);
+  assert.match(flow, /await browserStarted/);
+  assert.match(flow, /await applicationStarted/);
+  assert.match(flow, /await browserStopped/);
+  const browser = source.slice(source.indexOf("async function browserDownload("), source.indexOf("export function firstLaunchObservation("));
+  assert.ok(browser.indexOf('"--verify", "--deep", "--strict", CHROME') < browser.indexOf("startHeadfulChrome("));
+  assert.ok(browser.indexOf('"--assess", "--type", "execute", CHROME') < browser.indexOf("startHeadfulChrome("));
+  assert.doesNotMatch(browser, /run\("\/usr\/bin\/open"/);
   assert.doesNotMatch(source, /xattr[^\n]*(?:-d|-c|-w)|spctl[^\n]*(?:--master-disable|--disable)|tccutil|fuses\.write|\.updater\.install|chat\/completions/);
   assert.doesNotMatch(flow, /press\(.?Enter|key.?\s*:\s*.Enter/);
 });

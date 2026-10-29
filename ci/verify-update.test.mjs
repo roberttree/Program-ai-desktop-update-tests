@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
-  payloadChunk, rejectionOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
+  payloadChunk, rejectionOutcome, shellSeedObservation, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
 
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
@@ -158,10 +160,55 @@ test("checksum fault injection changes only a copy of the transmitted first chun
 
 test("synthetic shell marker is bounded, quoted and uses no inference endpoint", () => {
   const marker = "Public native update canary 11111111-2222-3333-4444-555555555555\n";
-  assert.equal(syntheticShellCommand(marker), `printf '%s' '${marker}' > update-canary.txt`);
+  const project = "/Users/runner/work/_temp/public-native-update-a1B2c3/synthetic-project";
+  const command = syntheticShellCommand(marker, project);
+  assert.equal(command, `/usr/bin/printf '%s\\n' '${marker.slice(0, -1)}' > '${project}/update-canary.txt'`);
+  assert.doesNotMatch(command, /[\r\n]/);
+  assert.match(command, /%s\\n/);
   for (const value of ["secret", marker + "x", "Public native update canary ';rm -rf /\n"]) {
-    assert.throws(() => syntheticShellCommand(value), { code: "synthetic_marker_invalid" });
+    assert.throws(() => syntheticShellCommand(value, project), { code: "synthetic_marker_invalid" });
   }
+  for (const target of ["/tmp/project", project + "/..", project.replace("runner", "owner"), project + "'", "relative"])
+    assert.throws(() => syntheticShellCommand(marker, target), { code: "synthetic_project_invalid" });
+});
+
+test("canary printf format has one actual backslash and produces exact LF bytes through a real profile-free shell", () => {
+  const expected = "Public native update canary 11111111-2222-3333-4444-555555555555\n";
+  const generated = syntheticShellCommand(expected, "/Users/runner/work/_temp/public-native-update-a1B2c3/synthetic-project");
+  const separator = generated.indexOf(" > '");
+  assert.ok(separator > 0);
+  const command = generated.slice(0, separator); // stdout-only; no file is created.
+  const format = /\/usr\/bin\/printf '([^']+)'/.exec(command)?.[1];
+  assert.deepEqual([...Buffer.from(format)], [37, 115, 92, 110]);
+  const parse = (value) => execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", value], {
+    env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 5000, maxBuffer: 4096,
+  });
+  const actual = parse(command);
+  assert.equal(actual, expected);
+  assert.equal(Buffer.byteLength(actual), 65);
+  assert.equal(Buffer.from(actual).at(-1), 10);
+  assert.equal(createHash("sha256").update(actual).digest("hex"), createHash("sha256").update(expected).digest("hex"));
+  const overescaped = parse(command.replace("%s\\n", "%s\\\\n"));
+  assert.notEqual(overescaped, expected);
+  assert.equal(overescaped.endsWith("\\n"), true);
+});
+
+test("shell canary diagnostics expose fixed state, optional actual exit and byte/digest facts without tool output", () => {
+  const expected = "Public native update canary 11111111-2222-3333-4444-555555555555\n";
+  const response = { info: { private: "never logged" }, parts: [{ type: "tool", state: { status: "completed", metadata: { output: "private tool output" } } }] };
+  const good = shellSeedObservation(response, expected, expected);
+  assert.equal(good.toolStatus, "completed");
+  assert.equal(good.exitCode, null); // Current shell API does not expose an exit code.
+  assert.equal(good.digestMatches, true);
+  assert.equal(good.actualEndsInLf, true);
+  assert.equal(good.literalBackslashNMatches, false);
+  const escaped = shellSeedObservation(response, expected, expected.slice(0, -1) + "\\n");
+  assert.equal(escaped.digestMatches, false);
+  assert.equal(escaped.literalBackslashNMatches, true);
+  response.parts[0].state.metadata.exit = 7;
+  assert.equal(shellSeedObservation(response, expected, undefined).exitCode, 7);
+  assert.equal(shellSeedObservation(response, expected, undefined).fileRead, false);
+  assert.doesNotMatch(JSON.stringify(good), /private|never logged|native update canary/);
 });
 
 test("preservation requires real saved messages, exact marker/store and signed-out state", () => {
