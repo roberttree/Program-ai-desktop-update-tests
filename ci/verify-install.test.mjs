@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { firstLaunchObservation, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+import { firstLaunchObservation, launchFailureCode, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+
+test("launch capability failures distinguish exact-owner PID, listener and open outcomes without calling them app failures", () => {
+  const value = { context: "browser", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
+    openTimedOut: false, dialogApproved: false };
+  assert.equal(launchFailureCode(value), "browser_process_missing");
+  assert.equal(launchFailureCode({ ...value, pidCount: 2 }), "browser_process_ambiguous");
+  assert.equal(launchFailureCode({ ...value, pidCount: 1, listener: "unverified", openStatus: "succeeded", openExitCode: 0 }), "browser_listener_unverified");
+  assert.equal(launchFailureCode({ ...value, openStatus: "failed", openExitCode: 1 }), "browser_open_failed");
+  assert.equal(launchFailureCode({ ...value, context: "application", openStatus: "failed", openTimedOut: true }), "application_open_failed");
+});
 
 test("only the ordinary exact-name downloaded-app Open/Cancel dialog is eligible", () => {
   const dialog = { text: ['“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?'], buttons: ["Cancel", "Open"] };
@@ -54,6 +64,12 @@ test("the actual driver guards first, proves ZIP app trust before Chrome, and ne
   assert.match(flow, /same|zip_dmg_app_mismatch/);
   assert.match(flow, /finder_install/);
   assert.match(flow, /\/global\/health/);
+  assert.match(source, /consoleUserIsRunner/);
+  assert.match(source, /guiBootstrapAvailable/);
+  assert.match(source, /allowFailure: true/);
+  assert.match(source, /observePhase\("browser_launch"\)/);
+  assert.match(source, /observePhase\("application_launch"\)/);
+  assert.doesNotMatch(source, /spawn\(|execFile\(/); // Application first launch remains LaunchServices.
   assert.doesNotMatch(source, /xattr[^\n]*(?:-d|-c|-w)|spctl[^\n]*(?:--master-disable|--disable)|tccutil|fuses\.write|\.updater\.install|chat\/completions/);
   assert.doesNotMatch(flow, /press\(.?Enter|key.?\s*:\s*.Enter/);
 });

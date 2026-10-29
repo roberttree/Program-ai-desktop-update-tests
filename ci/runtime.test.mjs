@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
-  PUBLIC_REPOSITORY, VerificationFailure, approvedRedirect, loopbackWebSocket, parseUpdaterConfiguration,
-  quarantineRecord, receipt, signatureIdentity, validateArtifact, validateCiFacts, validateMachOInventory, validatePins, validateZipArchive,
+  PUBLIC_REPOSITORY, VerificationFailure, approvedRedirect, launchObservation, loopbackWebSocket, parseUpdaterConfiguration,
+  quarantineRecord, receipt, signatureIdentity, staplerAction, staplerObservation, validateArtifact, validateCiFacts, validateMachOInventory, validatePins, validateZipArchive,
 } from "./runtime.mjs";
 
 const hash = "a".repeat(64);
@@ -30,6 +30,51 @@ function pins() {
     }])) };
 }
 const failure = (callback, code) => assert.throws(callback, (error) => error instanceof VerificationFailure && error.code === code);
+
+test("stapler diagnostics expose only numeric exit/category and retry only explicit documented transport errors", () => {
+  assert.deepEqual(staplerObservation({ exitCode: 0, stdout: "/private/path" }), { exitCode: 0, category: "validated" });
+  for (const code of [-1001, -1003, -1004, -1005, -1006, -1009]) {
+    const observed = staplerObservation({ exitCode: 68, stderr: `Error Domain=NSURLErrorDomain Code=${code} https://private.invalid` });
+    assert.deepEqual(observed, { exitCode: 68, category: "transient_network" });
+    assert.deepEqual(staplerAction(observed, 1), { retryAfterMs: 2000 });
+    assert.deepEqual(staplerAction(observed, 2), { retryAfterMs: 5000 });
+    assert.deepEqual(staplerAction(observed, 3), { kind: "unverified", code: "ticket_network_unverified" });
+  }
+  for (const result of [{ exitCode: 68 }, { exitCode: 68, stderr: "Network error" },
+    { exitCode: 68, stderr: "NSURLErrorDomain Code=-1202" }, { exitCode: 68, stderr: "NSURLErrorDomain Code=-1011" },
+    { exitCode: 68, stderr: "NSURLErrorDomain Code=-1001 NSURLErrorDomain Code=-1202" },
+    { exitCode: null, timedOut: true, stderr: "NSURLErrorDomain Code=-1001" }]) {
+    const observed = staplerObservation(result);
+    assert.equal(observed.category, "unknown");
+    assert.deepEqual(staplerAction(observed, 1), { kind: "unverified", code: "ticket_validation_unverified" });
+  }
+});
+
+test("missing, invalid or revoked tickets fail immediately rather than being retried as network faults", () => {
+  for (const exitCode of [65, 66, 77]) {
+    const observed = staplerObservation({ exitCode, stderr: "NSURLErrorDomain Code=-1001" });
+    assert.equal(observed.category, "ticket_rejected");
+    assert.deepEqual(staplerAction(observed, 1), { kind: "failed", code: "ticket_validation_rejected" });
+  }
+  assert.deepEqual(staplerAction(staplerObservation({ exitCode: 66, stderr: "does not have a ticket stapled to it" }), 1),
+    { kind: "failed", code: "stapled_ticket_missing" });
+});
+
+test("install launch observations and phases are fixed, bounded and cannot carry native identifiers or raw errors", () => {
+  const input = { context: "browser", pidCount: 1, listener: "unverified", openStatus: "succeeded", openExitCode: 0,
+    openTimedOut: false, dialogApproved: false, path: "/private/path", pid: 123, error: "private token" };
+  assert.equal(JSON.stringify(launchObservation(input)).includes("private"), false);
+  const value = receipt({ flow: "install", arch: "arm64", version: "1.0.9", status: "unverified", checks: [], phase: "browser_launch", launch: input });
+  assert.equal(value.phase, "browser_launch");
+  assert.equal(value.launch.pidCount, 1);
+  const gui = receipt({ ...value, gui: { consoleUserIsRunner: false, guiBootstrapAvailable: false, guiBootstrapExitCode: 113,
+    username: "private-user", stdout: "/private/raw" } });
+  assert.deepEqual(gui.gui, { consoleUserIsRunner: false, guiBootstrapAvailable: false, guiBootstrapExitCode: 113 });
+  assert.equal(JSON.stringify(gui).includes("private"), false);
+  failure(() => launchObservation({ ...input, pidCount: 123 }), "launch_observation_invalid");
+  failure(() => receipt({ ...value, phase: "/private/path" }), "receipt_invalid");
+  failure(() => receipt({ ...value, gui: { consoleUserIsRunner: "private-user", guiBootstrapAvailable: false, guiBootstrapExitCode: 113 } }), "receipt_invalid");
+});
 
 test("pure host policy admits native public ARM and Intel facts, not an emulation claim", () => {
   assert.equal(validateCiFacts(facts(), "arm64"), "arm64");

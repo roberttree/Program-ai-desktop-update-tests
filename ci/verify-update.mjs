@@ -15,7 +15,8 @@ export const SCENARIOS = Object.freeze([
   "positive", "offline", "unavailable", "interrupted", "checksum", "downgrade", "signature",
 ]);
 const PHASES = ["fresh_host", "download", "base_verify", "candidate_verify", "signature_fixture_verify",
-  "base_bootstrap", "preload_ready", "seed", "negative_check", "positive_download", "native_install",
+  "base_bootstrap", "base_spawn", "base_diagnostic_connect", "base_debugger_enable", "base_waiting_release", "base_pause_wait",
+  "base_attest", "base_feed", "base_debugger_resume", "base_debugger_disable", "preload_ready", "seed", "negative_check", "positive_download", "native_install",
   "replacement", "preservation", "cleanup", "completed"];
 
 export function parseScenario(args) {
@@ -229,28 +230,60 @@ function changeFeed(expected, value) {
   return true;
 }
 
-async function startBase(base, arch, version, feedUrl) {
+export function pausedCallFrame(event) {
+  const id = event?.callFrames?.[0]?.callFrameId;
+  return typeof id === "string" && id.length > 0 && id.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(id) ? id : undefined;
+}
+
+export async function evaluatePaused(main, callFrameId, expression) {
+  check(pausedCallFrame({ callFrames: [{ callFrameId }] }), "paused_frame_unverified");
+  // CDP defines this synchronous command for a paused call frame. Runtime's
+  // awaitPromise evaluation is not used before the owned VM resumes.
+  const result = await main.send("Debugger.evaluateOnCallFrame", {
+    callFrameId, expression, returnByValue: true, silent: true,
+  }, 20000);
+  check(!result?.exceptionDetails && result?.result?.type === "boolean" && result.result.value === true,
+    "paused_evaluation_unverified");
+  return true;
+}
+
+export async function bootstrapMain(main, expected, feedUrl, observePhase) {
+  let frame;
+  const stop = main.onEvent("Debugger.paused", (event) => { frame = pausedCallFrame(event); });
+  try {
+    observePhase("base_debugger_enable");
+    await main.send("Debugger.enable");
+    observePhase("base_waiting_release");
+    await main.send("Runtime.runIfWaitingForDebugger");
+    observePhase("base_pause_wait");
+    const callFrameId = await waitFor(() => frame, { timeoutMs: 10000, code: "signed_base_diagnostic_pause_unavailable" });
+    observePhase("base_attest");
+    await evaluatePaused(main, callFrameId, mainExpression(attestMain, expected));
+    // The shipping app starts its updater during startup. Override this owned
+    // singleton before resuming any app code, initially offering only N itself.
+    observePhase("base_feed");
+    await evaluatePaused(main, callFrameId, mainExpression(changeFeed, expected, feedUrl));
+    observePhase("base_debugger_resume");
+    await main.send("Debugger.resume");
+    observePhase("base_debugger_disable");
+    await main.send("Debugger.disable");
+  } finally { stop(); }
+}
+
+async function startBase(base, arch, version, feedUrl, observePhase) {
   const port = await unusedPort();
+  observePhase("base_spawn");
   const child = spawn(base.executable, [`--inspect-brk=127.0.0.1:${port}`], {
     env: applicationEnvironment(), stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.on("data", () => {}); // Consume but never retain app diagnostics.
   child.on("error", () => {});
   check(Number.isSafeInteger(child.pid) && child.pid > 1, "owned_spawn_unverified");
+  observePhase("base_diagnostic_connect");
   const main = await connectCdp(port, child.pid, { targetType: "node", executable: base.executable, timeoutMs: 30000 });
-  let paused = false;
-  const stop = main.onEvent("Debugger.paused", () => { paused = true; });
-  await main.send("Debugger.enable");
-  await main.send("Runtime.runIfWaitingForDebugger");
-  await waitFor(() => paused, { timeoutMs: 10000, code: "signed_base_diagnostic_pause_unavailable" });
   const expected = { pid: child.pid, executable: base.executable, resources: path.resolve(base.executable, "../../Resources"), arch, version };
-  check(await evaluate(main, mainExpression(attestMain, expected)), "signed_base_attestation_unverified");
-  // The shipping app starts its updater during startup. Override this owned
-  // singleton before resuming any app code, initially offering only N itself.
-  check(await evaluate(main, mainExpression(changeFeed, expected, feedUrl)), "initial_feed_override_unverified");
-  await main.send("Debugger.resume");
-  await main.send("Debugger.disable");
-  stop();
+  try { await bootstrapMain(main, expected, feedUrl, observePhase); }
+  catch (error) { main.close(); throw error; }
   return { main, expected, child };
 }
 
@@ -413,7 +446,7 @@ export async function runUpdateVerification(scenario) {
     feed = await makeFeed({ pins, arch: context.arch, files });
     const baselineTraffic = feed.select("baseline");
     phase = "base_bootstrap";
-    control = await startBase(base, context.arch, pins.baseVersion, feed.url);
+    control = await startBase(base, context.arch, pins.baseVersion, feed.url, (next) => { phase = next; });
     checks.push("native_launch");
     phase = "preload_ready";
     await ready(control);
