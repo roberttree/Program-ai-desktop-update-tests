@@ -79,12 +79,27 @@ export function dismissVisibleProductTour() {
 }
 
 export function clickVisibleModelTrigger() {
-  const nodes = Array.from(document.querySelectorAll('[data-component="prompt-model-control"] [data-action="prompt-model"]'))
+  const nodes = Array.from(document.querySelectorAll('[data-action="prompt-model"]'))
     .filter((node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0 &&
       !node.hasAttribute("disabled") && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]"));
   if (nodes.length !== 1) return false;
   nodes[0].click();
   return true;
+}
+
+export function workspaceObservation() {
+  const count = (selector) => Math.min(8, Array.from(document.querySelectorAll(selector))
+    .filter((node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0).length);
+  return { packagedIndexDocument: location.protocol === "program-ai:" && location.host === "renderer" &&
+      ["/", "/index.html"].includes(location.pathname),
+    newLayout: document.body.hasAttribute("data-new-layout"),
+    visibleV2Composers: count('form[data-component="prompt-input-v2"]'),
+    visibleEditors: count('[data-component="prompt-input"][contenteditable="true"]'),
+    visibleModelTriggers: count('[data-action="prompt-model"]'),
+    visibleTours: count('[data-component="product-tour"]'),
+    visibleAlerts: count('[role="alert"]'),
+    openingWorkspaceMessage: document.body.innerText.includes("Opening your workspace"),
+    notFoundDocument: /^Not found\s*$/.test(document.body.innerText) };
 }
 
 export function openVisibleSyntheticSession(title) {
@@ -155,7 +170,9 @@ function nativeBootstrap(expected, guardFactory, signInValidator) {
     process.env.PROGRAM_AI_EXPERIMENTAL_OUTPUT_TOKEN_MAX !== "512") throw new Error("owned_native_scope_required");
   const key = Symbol.for("program-ai-native-account-queue-verification");
   if (globalThis[key]) throw new Error("duplicate_native_budget_guard");
-  const budget = guardFactory(globalThis.fetch, { expiresAtMs: Date.now() + 300000 });
+  if (!Number.isSafeInteger(expected.budgetExpiresAtMs) || expected.budgetExpiresAtMs <= Date.now() ||
+    expected.budgetExpiresAtMs > Date.now() + 600000) throw new Error("owned_native_scope_required");
+  const budget = guardFactory(globalThis.fetch, { expiresAtMs: expected.budgetExpiresAtMs });
   globalThis.fetch = budget.fetch;
   const observed = { budget, signInUrl: undefined };
   globalThis[key] = observed;
@@ -178,9 +195,9 @@ async function inNativeWindow(expected, expression) {
   return windows[0].webContents.executeJavaScript(expression, true);
 }
 
-async function startCandidate(app, arch, onSpawn) {
+async function startCandidate(app, arch, onSpawn, budgetExpiresAtMs) {
   const port = await unusedPort();
-  const expected = { executable: app.executable, resources: path.resolve(app.executable, "../../Resources"), arch, version: app.version };
+  const expected = { executable: app.executable, resources: path.resolve(app.executable, "../../Resources"), arch, version: app.version, budgetExpiresAtMs };
   const child = spawn(app.executable, [`--inspect-brk=127.0.0.1:${port}`], {
     env: { ...applicationEnvironment(), PROGRAM_AI_EXPERIMENTAL_OUTPUT_TOKEN_MAX: "512" }, stdio: "ignore",
   });
@@ -237,8 +254,9 @@ async function sidecarRequest(connection, route, project, body) {
 
 async function selectMini(control) {
   check(await control.window(`(${clickVisibleModelTrigger.toString()})()`), "native_model_control_unavailable");
-  await waitFor(() => control.window(`(()=>{const input=document.querySelector('[data-composer-menu="true"] input, [role="dialog"] [data-slot="list-search-input"]');if(!input)return false;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'openai/gpt-4.1-mini');input.dispatchEvent(new Event('input',{bubbles:true}));return true})()`), { timeoutMs: 30000, code: "native_model_search_unavailable" });
-  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-option-key="openrouter:openai/gpt-4.1-mini"],[data-key="openrouter:openai/gpt-4.1-mini"]')).filter(x=>x.getBoundingClientRect().height>0&&!x.hasAttribute('data-disabled'));if(nodes.length!==1)return false;nodes[0].click();return true})()`), { timeoutMs: 30000, code: "native_exact_model_unavailable" });
+  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-composer-menu="true"] input, [role="dialog"] [data-slot="list-search-input"], [role="dialog"] input[type="search"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;const input=nodes[0];Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'openai/gpt-4.1-mini');input.dispatchEvent(new Event('input',{bubbles:true}));return true})()`), { timeoutMs: 30000, code: "native_model_search_unavailable" });
+  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-option-key="openrouter:openai/gpt-4.1-mini"],[data-key="openrouter:openai/gpt-4.1-mini"],[role="dialog"] button[data-provider-id="openrouter"][data-model-id="openai/gpt-4.1-mini"]')).filter(x=>x.getBoundingClientRect().height>0&&!x.hasAttribute('data-disabled')&&!x.disabled&&x.getAttribute('aria-disabled')!=='true');if(nodes.length!==1)return false;nodes[0].click();return true})()`), { timeoutMs: 30000, code: "native_exact_model_unavailable" });
+  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-action="prompt-model"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;const n=nodes[0];return n.hasAttribute('data-model-id')?n.getAttribute('data-provider-id')==='openrouter'&&n.getAttribute('data-model-id')==='openai/gpt-4.1-mini':n.textContent.includes('GPT-4.1 Mini')})()`), { timeoutMs: 10000, code: "native_selected_model_unverified" });
 }
 
 async function dismissProductTour(control) {
@@ -293,7 +311,7 @@ export async function runNativeAccountQueue() {
     const zip = await downloadPinned(artifact, path.join(root, artifact.name));
     const app = await verifyApp(await extractZip(zip, path.join(root, "candidate")), { pins, arch: context.arch });
     receipt.candidateAsarSha256 = app.asarSha256; receipt.candidateCdhash = app.cdhash;
-    receipt.phase = "native_bootstrap"; control = await startCandidate(app, context.arch, (owned) => { control = owned; });
+    receipt.phase = "native_bootstrap"; control = await startCandidate(app, context.arch, (owned) => { control = owned; }, Math.min(Date.now() + 600000, account.useUntilMs));
     await waitFor(() => control.window("!!window.api?.programAICloudAuth?.signIn&&!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "native_preload_unavailable" });
     receipt.phase = "browser_preflight"; browser = await startAuthBrowser(root, (owned) => { browser = owned; });
     receipt.phase = "normal_account_sign_in"; await normalWebSignIn(control, browser, account); receipt.accountConnected = true;
@@ -308,9 +326,10 @@ export async function runNativeAccountQueue() {
     await waitFor(() => control.window(`(${openVisibleSyntheticSession.toString()})(${JSON.stringify("Native account queue verification")})`),
       { timeoutMs: 60000, code: "native_session_row_unavailable" });
     receipt.workspaceOpenedVia = "normal_sidebar_session_button";
-    await waitFor(() => control.window("document.querySelector('[data-component=prompt-model-control]')?.getBoundingClientRect().height>0"), { timeoutMs: 90000, code: "native_composer_unavailable" });
+    await waitFor(() => control.window("(()=>{const editors=Array.from(document.querySelectorAll('[data-component=prompt-input][contenteditable=true]')).filter(n=>n.getBoundingClientRect().width>0&&n.getBoundingClientRect().height>0);const models=Array.from(document.querySelectorAll('[data-action=prompt-model]')).filter(n=>n.getBoundingClientRect().width>0&&n.getBoundingClientRect().height>0);return editors.length===1&&models.length===1})()"), { timeoutMs: 90000, code: "native_composer_unavailable" });
     receipt.phase = "workspace_tour"; receipt.tourDismissed = await dismissProductTour(control) || receipt.tourDismissed;
     receipt.phase = "model_select"; await selectMini(control);
+    receipt.modelSelected = "openai/gpt-4.1-mini";
     check(Date.now() < account.useUntilMs, "temporary_test_credentials_expired");
     check(await evaluate(control.main, `(()=>{const s=globalThis[Symbol.for(${JSON.stringify(MARK)})];return !!s&&globalThis.fetch===s.budget.fetch&&s.budget.read().attempted===0&&s.budget.read().rejected===0})()`), "native_budget_not_active");
     const marker = `PAI_QUEUE_${randomUUID()}`, prompts = syntheticQueuePrompts(project, marker), filename = path.join(project, "queue-result.txt");
@@ -352,6 +371,7 @@ export async function runNativeAccountQueue() {
   } finally {
     if (guarded) {
       if (control?.main) {
+        if (receipt.status !== "passed" && control.window) receipt.workspace = await control.window(`(${workspaceObservation.toString()})()`, 3000).catch(() => ({ unavailable: true }));
         const finalBudget = await evaluate(control.main, `(()=>{const s=globalThis[Symbol.for(${JSON.stringify(MARK)})];return s?{active:globalThis.fetch===s.budget.fetch,budget:s.budget.read()}:null})()`, 2000).catch(() => null);
         receipt.nativeBudgetActive = finalBudget?.active === true;
         if (finalBudget?.budget) receipt.budget = budgetObservation(finalBudget.budget);
