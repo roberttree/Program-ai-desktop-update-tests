@@ -87,6 +87,17 @@ export function clickVisibleModelTrigger() {
   return true;
 }
 
+export function openVisibleSyntheticSession(title) {
+  if (title !== "Native account queue verification") return false;
+  const rows = Array.from(document.querySelectorAll('button.program-ai-session-row'))
+    .filter((node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0 &&
+      !node.disabled && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]") &&
+      node.querySelector('.program-ai-sidebar-row-title')?.textContent.trim() === title);
+  if (rows.length !== 1) return false;
+  rows[0].click();
+  return true;
+}
+
 export function syntheticQueuePrompts(project, marker) {
   check(/^\/Users\/runner\/[^\r\n'`$]*\/native-account-queue-[A-Za-z0-9]{6}\/project$/.test(project) &&
     path.normalize(project) === project && /^PAI_QUEUE_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(marker), "synthetic_project_scope_invalid");
@@ -290,8 +301,13 @@ export async function runNativeAccountQueue() {
     receipt.phase = "sidecar_ready"; const connection = await sidecarConnection(control);
     receipt.phase = "session_create"; const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
     check(typeof session.id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(session.id), "native_session_unverified");
-    const route = `program-ai://renderer/${Buffer.from(project).toString("base64url")}/session/${session.id}`;
-    receipt.phase = "workspace_open"; await control.window(`location.href=${JSON.stringify(route)};true`);
+    // The packaged renderer uses MemoryRouter. Open the actual saved session
+    // button, which registers its project and selects its tab through normal UI.
+    // A document-level location change would instead request a nonexistent file.
+    receipt.phase = "workspace_open";
+    await waitFor(() => control.window(`(${openVisibleSyntheticSession.toString()})(${JSON.stringify("Native account queue verification")})`),
+      { timeoutMs: 60000, code: "native_session_row_unavailable" });
+    receipt.workspaceOpenedVia = "normal_sidebar_session_button";
     await waitFor(() => control.window("document.querySelector('[data-component=prompt-model-control]')?.getBoundingClientRect().height>0"), { timeoutMs: 90000, code: "native_composer_unavailable" });
     receipt.phase = "workspace_tour"; receipt.tourDismissed = await dismissProductTour(control) || receipt.tourDismissed;
     receipt.phase = "model_select"; await selectMini(control);

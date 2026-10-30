@@ -2,6 +2,16 @@ name: Verify disposable native desktop accounts
 
 on:
   workflow_dispatch:
+    inputs:
+      architecture:
+        description: Native architecture to verify using the existing browser
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - arm64
+          - x64
 
 permissions:
   contents: read
@@ -34,6 +44,7 @@ jobs:
       - name: Verify pure test-driver contracts without credentials
         run: node --test ci/*.test.mjs
       - name: Verify actual account handoff and queued file creation
+        if: inputs.architecture == 'both' || matrix.arch == inputs.architecture
         run: node ci/native-account-queue.mjs
         env:
           PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL || '' }}

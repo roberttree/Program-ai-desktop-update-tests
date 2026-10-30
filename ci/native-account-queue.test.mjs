@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { accountInputs, budgetObservation, cleanupFailureObservation, clickVisibleModelTrigger, dismissVisibleProductTour, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
+import { accountInputs, budgetObservation, cleanupFailureObservation, clickVisibleModelTrigger, dismissVisibleProductTour, openVisibleSyntheticSession, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
 
 const runId = "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948";
 const accountId = "12345678-1234-1234-1234-123456789abc";
@@ -134,6 +134,24 @@ test("fresh-account tour is dismissed only through its unique normal visible Ski
   assert.equal(invoke({ querySelectorAll: () => [{ ...tour, querySelectorAll: () => [{ ...button, disabled: true }] }] }), "unverified");
   assert.equal(clicked, 1);
   assert.doesNotMatch(dismissVisibleProductTour.toString(), /store|localStorage|setSession|onDismiss/);
+});
+
+test("workspace opens through the actual unique saved-session button without document or router-state mutation", async () => {
+  let clicked = 0, selector;
+  const title = "Native account queue verification";
+  const row = { disabled: false, getBoundingClientRect: () => ({ width: 80, height: 30 }),
+    getAttribute: () => null, closest: () => null, querySelector: () => ({ textContent: title }), click: () => clicked++ };
+  const invoke = Function("document", "title", `return (${openVisibleSyntheticSession.toString()})(title)`);
+  assert.equal(invoke({ querySelectorAll(value) { selector = value; return [row]; } }, title), true);
+  assert.equal(selector, "button.program-ai-session-row");
+  assert.equal(clicked, 1);
+  assert.equal(invoke({ querySelectorAll: () => [row, row] }, title), false);
+  assert.equal(invoke({ querySelectorAll: () => [{ ...row, disabled: true }] }, title), false);
+  assert.equal(invoke({ querySelectorAll: () => [row] }, "Customer session"), false);
+  assert.equal(clicked, 1);
+  const source = await readFile(new URL("./native-account-queue.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /location\.href\s*=|history\.pushState|history\.replaceState|PopStateEvent/);
+  assert.match(source, /workspaceOpenedVia = "normal_sidebar_session_button"/);
 });
 
 test("live prototype proves exact public native CI and trust before spawning, installs budget before startup, and has no auth shortcut", async () => {
