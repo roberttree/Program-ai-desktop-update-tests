@@ -257,13 +257,13 @@ export async function runNativeAccountQueue() {
     await waitFor(() => control.window("!!window.api?.programAICloudAuth?.signIn&&!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "native_preload_unavailable" });
     receipt.phase = "browser_preflight"; browser = await startAuthBrowser(root, (owned) => { browser = owned; });
     receipt.phase = "normal_account_sign_in"; await normalWebSignIn(control, browser, account); receipt.accountConnected = true;
-    const connection = await sidecarConnection(control);
-    const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
+    receipt.phase = "sidecar_ready"; const connection = await sidecarConnection(control);
+    receipt.phase = "session_create"; const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
     check(typeof session.id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(session.id), "native_session_unverified");
     const route = `program-ai://renderer/${Buffer.from(project).toString("base64url")}/session/${session.id}`;
-    await control.window(`location.href=${JSON.stringify(route)};true`);
+    receipt.phase = "workspace_open"; await control.window(`location.href=${JSON.stringify(route)};true`);
     await waitFor(() => control.window("document.querySelector('[data-component=prompt-model-control]')?.getBoundingClientRect().height>0"), { timeoutMs: 90000, code: "native_composer_unavailable" });
-    await selectMini(control);
+    receipt.phase = "model_select"; await selectMini(control);
     check(Date.now() < account.useUntilMs, "temporary_test_credentials_expired");
     check(await evaluate(control.main, `(()=>{const s=globalThis[Symbol.for(${JSON.stringify(MARK)})];return !!s&&globalThis.fetch===s.budget.fetch&&s.budget.read().attempted===0&&s.budget.read().rejected===0})()`), "native_budget_not_active");
     const marker = `PAI_QUEUE_${randomUUID()}`, prompts = syntheticQueuePrompts(project, marker), filename = path.join(project, "queue-result.txt");
