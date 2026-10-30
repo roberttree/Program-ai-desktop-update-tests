@@ -16,7 +16,7 @@ export const SCENARIOS = Object.freeze([
 ]);
 const PHASES = ["fresh_host", "download", "base_verify", "candidate_verify", "signature_fixture_verify",
   "base_bootstrap", "base_spawn", "base_diagnostic_connect", "base_debugger_enable", "base_waiting_release", "base_pause_wait",
-  "base_attest", "base_feed", "base_debugger_resume", "base_debugger_disable", "preload_ready", "seed", "negative_check", "positive_download", "native_install",
+  "base_attest", "base_feed", "base_debugger_resume", "base_debugger_disable", "preload_ready", "seed", "negative_check", "signature_native_preflight", "signature_restart", "positive_download", "native_install",
   "replacement", "preservation", "cleanup", "completed"];
 
 export function parseScenario(args) {
@@ -62,6 +62,9 @@ export function updaterObservation(value) {
 
 export function rejectionOutcome(scenario, observed, traffic) {
   check(SCENARIOS.includes(scenario) && scenario !== "positive", "scenario_invalid");
+  // On macOS with autoInstallOnAppQuit=false, ready means downloaded, NOT
+  // Squirrel signature validation. Only signatureInstallOutcome can attest it.
+  if (scenario === "signature") return "unverified";
   if (scenario === "downgrade") {
     if (observed.status === "ready" || observed.status === "installing" || traffic.zip > 0) return "failed";
     return observed.status === "up-to-date" && traffic.metadata > 0 ? "passed" : "unverified";
@@ -72,7 +75,128 @@ export function rejectionOutcome(scenario, observed, traffic) {
   if (scenario === "interrupted") return traffic.interrupted > 0 && traffic.sent > 0 ? "passed" : "unverified";
   if (scenario === "checksum") return traffic.corrupted > 0 && traffic.sent >= traffic.expectedBytes &&
     observed.errorClass === "checksum" ? "passed" : "unverified";
-  return traffic.sent >= traffic.expectedBytes && observed.errorClass === "signature" ? "passed" : "unverified";
+  return "unverified";
+}
+
+// Observe native events only: never replace checks, feed, quit, install or
+// listeners owned by the product/SDK. SQRLCodeSignatureErrorDidNotPass=-1 and
+// CouldNotCreateStaticCode=-2 are Squirrel.Mac's actual signature error enums.
+export function createNativeSignatureObserver(native, app) {
+  let errors = 0, signatureErrors = 0, signatureCode = null, downloaded = false, beforeQuit = false;
+  const failed = (error) => {
+    errors = Math.min(16, errors + 1);
+    if (error?.domain === "SQRLCodeSignatureErrorDomain" && [-1, -2].includes(error.code)) {
+      signatureErrors = Math.min(16, signatureErrors + 1); signatureCode = error.code;
+    }
+  };
+  const accepted = () => { downloaded = true; };
+  const quitting = () => { beforeQuit = true; };
+  native.on("error", failed); native.on("update-downloaded", accepted); app.on("before-quit", quitting);
+  return {
+    read: () => ({ errors, signatureErrors, signatureCode, downloaded, beforeQuit }),
+    close() { native.removeListener("error", failed); native.removeListener("update-downloaded", accepted); app.removeListener("before-quit", quitting); },
+  };
+}
+
+export function signatureInstallOutcome({ native, attempt, originalPid, baseAsar, sidecarUnchanged, completePayload }) {
+  if (!originalPid || !baseAsar || !sidecarUnchanged || native?.downloaded || native?.beforeQuit || attempt?.resolved) return "failed";
+  return completePayload === true && attempt?.rejected === true && native?.errors >= 1 && native.errors < 16 &&
+    native.signatureErrors === native.errors && [-1, -2].includes(native.signatureCode) ? "passed" : "unverified";
+}
+
+function nativeProbe(expected, action, factory) {
+  const require = process.getBuiltinModule("module").createRequire(process.resourcesPath + "/app.asar/package.json");
+  const electron = require("electron");
+  if (process.pid !== expected.pid || process.execPath !== expected.executable || process.resourcesPath !== expected.resources ||
+    !electron.app.isPackaged || electron.app.getVersion() !== expected.version) throw new Error("owned_scope_required");
+  const key = Symbol.for("program-ai-public-native-signature-observer");
+  if (action === "arm") {
+    if (globalThis[key]) throw new Error("native_observer_already_armed");
+    globalThis[key] = factory(electron.autoUpdater, electron.app);
+  }
+  const observer = globalThis[key];
+  if (!observer) throw new Error("native_observer_missing");
+  const result = observer.read();
+  if (action === "close") { observer.close(); delete globalThis[key]; }
+  return result;
+}
+
+function probeExpression(expected, action) {
+  check(["arm", "read", "close"].includes(action), "native_observer_action_invalid");
+  return `(${nativeProbe.toString()})(${JSON.stringify(expected)},${JSON.stringify(action)},(${createNativeSignatureObserver.toString()}))`;
+}
+
+const INSTALL_ATTEMPT = "program-ai-public-native-signature-install";
+function signaturePreloadAttempt(action, key) {
+  const symbol = Symbol.for(key);
+  if (action === "start") {
+    if (globalThis[symbol]) throw new Error("signature_attempt_already_started");
+    const value = { rejected: false, resolved: false };
+    globalThis[symbol] = value;
+    // REAL unchanged preload API. No cancellation or mocked native outcome.
+    void window.api.updater.install().then(() => { value.resolved = true; }, () => { value.rejected = true; });
+  }
+  const value = globalThis[symbol];
+  if (!value) throw new Error("signature_attempt_missing");
+  return { rejected: value.rejected === true, resolved: value.resolved === true };
+}
+
+async function assertOriginalProcess(control) {
+  const pids = await findOwnedPids(control.expected.executable);
+  if (pids.length === 1 && pids[0] === control.expected.pid) return;
+  // A replaced/extra app at the exact owned executable is never accepted.
+  for (const pid of pids) await terminateOwned(control.expected.executable, pid);
+  throw new VerificationFailure("failed", "signature_original_process_changed");
+}
+
+async function verifyNativeSignatureRejection(control, base, before, traffic) {
+  const connection = await sidecar(control);
+  await evaluate(control.main, probeExpression(control.expected, "arm"));
+  try {
+    await windowValue(control, `(${signaturePreloadAttempt.toString()})("start",${JSON.stringify(INSTALL_ATTEMPT)})`);
+    const observed = await waitFor(async () => {
+      await assertOriginalProcess(control);
+      const native = await evaluate(control.main, probeExpression(control.expected, "read"));
+      if (native.downloaded || native.beforeQuit) {
+        for (const pid of await findOwnedPids(base.executable)) await terminateOwned(base.executable, pid);
+        throw new VerificationFailure("failed", "signature_native_accepted");
+      }
+      const attempt = await windowValue(control, `(${signaturePreloadAttempt.toString()})("read",${JSON.stringify(INSTALL_ATTEMPT)})`);
+      if (attempt.resolved) {
+        for (const pid of await findOwnedPids(base.executable)) await terminateOwned(base.executable, pid);
+        throw new VerificationFailure("failed", "signature_native_accepted");
+      }
+      return attempt.rejected || attempt.resolved ? { native, attempt } : false;
+    }, { timeoutMs: 210000, intervalMs: 100, code: "signature_native_rejection_unverified" });
+    await assertOriginalProcess(control);
+    observed.native = await evaluate(control.main, probeExpression(control.expected, "read"));
+    const baseAsar = await sha256File(path.resolve(base.executable, "../../Resources/app.asar")) === base.asarSha256;
+    if (!baseAsar || observed.native.downloaded || observed.native.beforeQuit) {
+      for (const pid of await findOwnedPids(base.executable)) await terminateOwned(base.executable, pid);
+      throw new VerificationFailure("failed", "signature_native_accepted");
+    }
+    const currentConnection = await sidecar(control);
+    const sidecarUnchanged = connection.url === currentConnection.url && connection.authorization === currentConnection.authorization;
+    const outcome = signatureInstallOutcome({ ...observed, originalPid: true, baseAsar, sidecarUnchanged,
+      completePayload: traffic.metadata > 0 && traffic.sent >= traffic.expectedBytes });
+    console.log(JSON.stringify({ schemaVersion: 1, check: "signature_native_preflight", outcome,
+      ...observed.native, preloadRejected: observed.attempt.rejected, originalPid: true, baseAsar, sidecarUnchanged }));
+    check(outcome === "passed", `signature_native_rejection_${outcome}`, outcome === "failed" ? "failed" : "unverified");
+    // Real saved-session read proves the original sidecar still serves data.
+    await localRequest(connection, `/session/${before.session}`, before.project);
+    await preserved(control, before);
+  } finally {
+    await evaluate(control.main, probeExpression(control.expected, "close")).catch(() => undefined);
+  }
+}
+
+function quitOwnedBase(expected) {
+  const require = process.getBuiltinModule("module").createRequire(process.resourcesPath + "/app.asar/package.json");
+  const electron = require("electron");
+  if (process.pid !== expected.pid || process.execPath !== expected.executable || process.resourcesPath !== expected.resources ||
+    !electron.app.isPackaged || electron.app.getVersion() !== expected.version) throw new Error("owned_scope_required");
+  setTimeout(() => electron.app.quit(), 150);
+  return true;
 }
 
 export function validatePreservation(before, after) {
@@ -103,6 +227,14 @@ export function shellSeedObservation(response, expected, actual) {
     digestMatches: typeof actual === "string" && createHash("sha256").update(actual).digest("hex") === createHash("sha256").update(expected).digest("hex"),
     actualEndsInLf: typeof actual === "string" && actual.endsWith("\n"),
     literalBackslashNMatches: typeof actual === "string" && actual === expected.slice(0, -1) + "\\n" };
+}
+
+export function nativeShellCommandFixture(project) {
+  check(typeof project === "string" && /^\/Users\/runner\/(?:[A-Za-z0-9_-]+\/)*public-native-update-[A-Za-z0-9]{6}\/synthetic-project$/.test(project),
+    "synthetic_project_invalid");
+  const filename = `${project}/native-shell-command-canary.txt`;
+  return { filename, expected: "Native shell command fixture\nliteral $(/usr/bin/printf MUST_STAY_LITERAL)\n",
+    command: `/usr/bin/printf '%s\\n' 'Native shell command fixture' > '${filename}'\n/usr/bin/printf '%s\\n' 'literal $(/usr/bin/printf MUST_STAY_LITERAL)' >> '${filename}'` };
 }
 
 export function payloadChunk(chunk, scenario, alreadyChanged) {
@@ -291,8 +423,9 @@ export async function bootstrapMain(main, expected, feedUrl, observePhase) {
 
 async function startBase(base, arch, version, feedUrl, observePhase) {
   const port = await unusedPort();
+  const rendererPort = await unusedPort();
   observePhase("base_spawn");
-  const child = spawn(base.executable, [`--inspect-brk=127.0.0.1:${port}`], {
+  const child = spawn(base.executable, [`--inspect-brk=127.0.0.1:${port}`, `--remote-debugging-port=${rendererPort}`, "--remote-debugging-address=127.0.0.1"], {
     env: applicationEnvironment(), stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.on("data", () => {}); // Consume but never retain app diagnostics.
@@ -303,7 +436,7 @@ async function startBase(base, arch, version, feedUrl, observePhase) {
   const expected = { pid: child.pid, executable: base.executable, resources: path.resolve(base.executable, "../../Resources"), arch, version };
   try { await bootstrapMain(main, expected, feedUrl, observePhase); }
   catch (error) { main.close(); throw error; }
-  return { main, expected, child };
+  return { main, expected, child, rendererPort };
 }
 
 async function windowValue(control, expression, timeoutMs = 30000) {
@@ -377,6 +510,22 @@ async function preserved(control, before) {
   check(validatePreservation(before, after), "synthetic_state_not_preserved", "failed");
 }
 
+async function nativeShellCommandRegression(control, before) {
+  const fixture = nativeShellCommandFixture(before.project);
+  check(!(await stat(fixture.filename).catch(() => undefined)), "native_shell_fixture_preexisting");
+  const connection = await sidecar(control);
+  const response = await localRequest(connection, `/session/${before.session}/shell`, before.project, { agent: "build", command: fixture.command });
+  const parts = Array.isArray(response?.parts) ? response.parts.filter((part) => part.type === "tool") : [];
+  const status = parts.length === 1 && ["pending", "running", "completed", "error"].includes(parts[0].state?.status) ? parts[0].state.status : "unknown";
+  const info = await stat(fixture.filename).catch(() => undefined);
+  const bytes = info?.isFile() && info.size <= 4096 ? await readFile(fixture.filename) : undefined;
+  const matches = !!bytes && bytes.equals(Buffer.from(fixture.expected));
+  console.log(JSON.stringify({ schemaVersion: 1, check: "native_shell_command", toolStatus: status,
+    fileRead: !!bytes, expectedBytes: Buffer.byteLength(fixture.expected), actualBytes: bytes?.length ?? null, byteMatch: matches,
+    paidCoding: false, editorDraftRestoration: "not_claimed", queueDrain: "not_claimed" }));
+  check(status === "completed" && matches, "native_shell_command_unverified");
+}
+
 async function checkUpdate(control) {
   return windowValue(control, `(async()=>(${updaterObservation.toString()})(await window.api.updater.check()))()`, 300000);
 }
@@ -402,21 +551,110 @@ async function setFeed(control, url) {
   check(await evaluate(control.main, mainExpression(changeFeed, control.expected, url)), "owned_feed_override_unverified");
 }
 
-async function replacement(base, oldPid, arch, pins) {
-  const pid = await waitFor(async () => {
-    const pids = await findOwnedPids(base.executable);
-    return pids.length === 1 && pids[0] !== oldPid ? pids[0] : false;
-  }, { timeoutMs: 180000, code: "native_relaunch_unverified" });
-  const installed = await verifyApp(path.resolve(base.executable, "../../.."), { pins, arch });
-  check(installed.version === pins.version, "installed_version_mismatch", "failed");
-  const occupied = await run("/usr/sbin/lsof", ["-nP", "-iTCP:9229", "-sTCP:LISTEN", "-F", "p"], { allowFailure: true });
-  check(!occupied.stdout.trim(), "replacement_diagnostic_port_occupied");
-  check((await findOwnedPids(base.executable)).includes(pid), "replacement_owner_unverified");
-  process.kill(pid, "SIGUSR1"); // Exact new signed-process diagnostic capability, never a fuse change.
-  const main = await connectCdp(9229, pid, { targetType: "node", executable: base.executable, timeoutMs: 30000 });
-  const expected = { pid, executable: base.executable, resources: path.resolve(base.executable, "../../Resources"), arch, version: pins.version };
-  check(await evaluate(main, mainExpression(attestMain, expected)), "replacement_attestation_unverified");
-  return { main, expected, installed };
+export function createInstallPromiseObserver(invoke) {
+  let outcome = "pending", errorClass = "none";
+  const rejected = (error) => {
+    const message = (error instanceof Error ? error.message : typeof error === "string" ? error : "").slice(0, 2048);
+    errorClass = /signature|code.?sign|publisher|SQRLCodeSignatureErrorDomain/i.test(message) ? "signature" :
+      /not ready/i.test(message) ? "not_ready" : /EACCES|EPERM|permission denied/i.test(message) ? "permission" :
+      /network|socket|connect|download|http|offline|timeout/i.test(message) ? "network" : "other";
+    outcome = "rejected";
+  };
+  return {
+    start() { try { void invoke().then(() => { outcome = "resolved"; }, rejected); } catch (error) { rejected(error); } },
+    read: () => ({ outcome, errorClass }),
+  };
+}
+
+function replacementPreloadProbe(action, key, factory) {
+  if (location.protocol !== "program-ai:" || location.hostname !== "renderer" || typeof window.api?.updater?.install !== "function")
+    throw new Error("owned_renderer_required");
+  const symbol = Symbol.for(key);
+  if (action === "schedule") {
+    if (globalThis[symbol]) throw new Error("install_observer_already_scheduled");
+    const observer = factory(() => window.api.updater.install());
+    globalThis[symbol] = observer;
+    setTimeout(() => observer.start(), 1500); // Same real preload request and original delay.
+  }
+  if (!["schedule", "read"].includes(action) || !globalThis[symbol]) throw new Error("install_observer_missing");
+  return globalThis[symbol].read();
+}
+
+function replacementProbeExpression(action) {
+  return `(${replacementPreloadProbe.toString()})(${JSON.stringify(action)},"program-ai-public-replacement-install-observer",(${createInstallPromiseObserver.toString()}))`;
+}
+
+export function installPromiseObservation(value) {
+  check(value && ["pending", "resolved", "rejected"].includes(value.outcome) &&
+    ["none", "signature", "not_ready", "permission", "network", "other"].includes(value.errorClass) &&
+    (value.outcome === "rejected" ? value.errorClass !== "none" : value.errorClass === "none"), "install_observation_invalid");
+  return { outcome: value.outcome, errorClass: value.errorClass };
+}
+
+export function replacementObservation(value) {
+  const count = (name) => Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
+  return { install: installPromiseObservation(value.install), oldPidChecked: value.oldPidChecked === true, oldPidAlive: value.oldPidAlive === true,
+    processCountsChecked: value.processCountsChecked === true, baseProcessCount: count("baseProcessCount"),
+    candidateProcessCount: count("candidateProcessCount"), newProcessCount: count("newProcessCount"),
+    installedVersion: typeof value.installedVersion === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value.installedVersion) ? value.installedVersion : null,
+    installedCdhashChecked: value.installedCdhashChecked === true, installedAsarChecked: value.installedAsarChecked === true,
+    installedCandidateCdhashMatches: value.installedCandidateCdhashMatches === true, installedCandidateAsarMatches: value.installedCandidateAsarMatches === true,
+    installedBaseCdhashMatches: value.installedBaseCdhashMatches === true, installedBaseAsarMatches: value.installedBaseAsarMatches === true };
+}
+
+async function readInstallObserver(observer) {
+  if (!observer.renderer) return;
+  try { observer.last = installPromiseObservation(await observer.renderer.evaluate(replacementProbeExpression("read"), 1000)); }
+  catch { observer.renderer.close(); observer.renderer = undefined; }
+}
+
+async function reportReplacement(base, candidate, oldPid, observer) {
+  await readInstallObserver(observer);
+  const basePids = await findOwnedPids(base.executable).catch(() => undefined);
+  const candidatePids = await findOwnedPids(candidate.executable).catch(() => undefined);
+  const alive = await run("/bin/ps", ["-p", String(oldPid), "-o", "pid="], { allowFailure: true, timeoutMs: 5000, maxBytes: 4096 });
+  const app = path.resolve(base.executable, "../../..");
+  const info = await run("/usr/bin/plutil", ["-convert", "json", "-o", "-", path.join(app, "Contents/Info.plist")], { allowFailure: true, timeoutMs: 5000, maxBytes: 65536 });
+  let installedVersion;
+  try { if (info.exitCode === 0) installedVersion = JSON.parse(info.stdout).CFBundleShortVersionString; } catch {}
+  const signature = await run("/usr/bin/codesign", ["-dvvv", app], { allowFailure: true, timeoutMs: 5000, maxBytes: 65536 });
+  const cdhash = signature.exitCode === 0 ? /^CDHash=([a-f0-9]{40,64})$/m.exec(signature.stdout + signature.stderr)?.[1] : undefined;
+  const asar = await sha256File(path.join(app, "Contents/Resources/app.asar")).catch(() => undefined);
+  console.log(JSON.stringify({ schemaVersion: 1, check: "replacement_diagnostics", ...replacementObservation({ install: observer.last,
+    oldPidChecked: [0, 1].includes(alive.exitCode), oldPidAlive: alive.exitCode === 0 && alive.stdout.trim() === String(oldPid),
+    processCountsChecked: !!basePids && !!candidatePids, baseProcessCount: basePids?.length, candidateProcessCount: candidatePids?.length,
+    newProcessCount: basePids && candidatePids ? new Set([...basePids, ...candidatePids].filter((pid) => pid !== oldPid)).size : undefined,
+    installedVersion, installedCdhashChecked: !!cdhash, installedAsarChecked: !!asar,
+    installedCandidateCdhashMatches: !!cdhash && cdhash === candidate.cdhash, installedCandidateAsarMatches: !!asar && asar === candidate.asarSha256,
+    installedBaseCdhashMatches: !!cdhash && cdhash === base.cdhash, installedBaseAsarMatches: !!asar && asar === base.asarSha256,
+  }) }));
+}
+
+async function replacement(base, candidate, oldPid, arch, pins, observer) {
+  try {
+    let lastObservation = 0;
+    const pid = await waitFor(async () => {
+      if (Date.now() - lastObservation >= 1000) { await readInstallObserver(observer); lastObservation = Date.now(); }
+      const pids = await findOwnedPids(base.executable);
+      return pids.length === 1 && pids[0] !== oldPid ? pids[0] : false;
+    }, { timeoutMs: 180000, code: "native_relaunch_unverified" });
+    const installed = await verifyApp(path.resolve(base.executable, "../../.."), { pins, arch });
+    check(installed.version === pins.version, "installed_version_mismatch", "failed");
+    const occupied = await run("/usr/sbin/lsof", ["-nP", "-iTCP:9229", "-sTCP:LISTEN", "-F", "p"], { allowFailure: true });
+    check(!occupied.stdout.trim(), "replacement_diagnostic_port_occupied");
+    check((await findOwnedPids(base.executable)).includes(pid), "replacement_owner_unverified");
+    process.kill(pid, "SIGUSR1"); // Exact new signed-process diagnostic capability, never a fuse change.
+    const main = await connectCdp(9229, pid, { targetType: "node", executable: base.executable, timeoutMs: 30000 });
+    const expected = { pid, executable: base.executable, resources: path.resolve(base.executable, "../../Resources"), arch, version: pins.version };
+    check(await evaluate(main, mainExpression(attestMain, expected)), "replacement_attestation_unverified");
+    return { main, expected, installed };
+  } finally {
+    // Diagnostic observations never replace any native PID/trust/pass gate.
+    await reportReplacement(base, candidate, oldPid, observer).catch(() => {
+      console.log(JSON.stringify({ schemaVersion: 1, check: "replacement_diagnostics", diagnosticStatus: "unavailable", install: observer.last }));
+    });
+    observer.renderer?.close();
+  }
 }
 
 export async function runUpdateVerification(scenario) {
@@ -426,6 +664,7 @@ export async function runUpdateVerification(scenario) {
   let control;
   let feed;
   let executable;
+  let installObserver;
   let status = "unverified";
   let code;
   let phase = "fresh_host";
@@ -486,12 +725,40 @@ export async function runUpdateVerification(scenario) {
       const traffic = feed.select(scenario);
       await setFeed(control, feed.url);
       const observed = await checkUpdate(control);
-      const outcome = rejectionOutcome(scenario, observed, traffic);
-      check(outcome === "passed", `${scenario}_rejection_${outcome}`, outcome === "failed" ? "failed" : "unverified");
+      if (scenario === "signature") {
+        check(observed.status === "ready" && observed.version === pins.version && traffic.metadata > 0 &&
+          traffic.sent >= traffic.expectedBytes, "signature_download_unverified");
+        phase = "signature_native_preflight";
+        await verifyNativeSignatureRejection(control, base, before, traffic);
+      } else {
+        const outcome = rejectionOutcome(scenario, observed, traffic);
+        check(outcome === "passed", `${scenario}_rejection_${outcome}`, outcome === "failed" ? "failed" : "unverified");
+      }
       check(await findOwnedPid(base.executable) === control.expected.pid &&
         await sha256File(path.join(baseApp, "Contents/Resources/app.asar")) === base.asarSha256, "base_changed_after_rejection", "failed");
       await preserved(control, before);
       checks.push("failure_rejected");
+      if (scenario === "signature") {
+        // The shipping preflight deliberately caches rejection and asks for a
+        // restart. Honor that contract; do not reset its promise or SDK state.
+        phase = "signature_restart";
+        const oldPid = control.expected.pid;
+        const quiescent = feed.select("baseline");
+        await evaluate(control.main, mainExpression(quitOwnedBase, control.expected));
+        await waitFor(async () => (await findOwnedPids(base.executable)).length === 0,
+          { timeoutMs: 30000, code: "signature_base_quit_unverified" });
+        control.main.close(); control = undefined;
+        check(await sha256File(path.join(baseApp, "Contents/Resources/app.asar")) === base.asarSha256,
+          "base_changed_after_rejection", "failed");
+        control = await startBase(base, context.arch, pins.baseVersion, feed.url, (next) => { phase = next; });
+        phase = "signature_restart";
+        check(control.expected.pid !== oldPid, "signature_base_restart_unverified");
+        await ready(control);
+        const restarted = await checkUpdate(control);
+        check(restarted.status === "up-to-date" && quiescent.metadata > 0 && quiescent.zip === 0,
+          "signature_restart_feed_not_quiescent");
+        await preserved(control, before);
+      }
     }
     phase = "positive_download";
     const traffic = feed.select("positive");
@@ -504,13 +771,15 @@ export async function runUpdateVerification(scenario) {
     phase = "native_install";
     // Schedule the real preload request in the existing renderer, then close
     // the owned inspector before that request can trigger native quit/relaunch.
-    await windowValue(control, "(()=>{setTimeout(()=>void window.api.updater.install().catch(()=>{}),1500);return true})()");
+    const renderer = await connectCdp(control.rendererPort, oldPid, { targetType: "page", executable: base.executable, timeoutMs: 5000 }).catch(() => undefined);
+    installObserver = { renderer, last: { outcome: "pending", errorClass: "none" } };
+    installObserver.last = installPromiseObservation(await windowValue(control, replacementProbeExpression("schedule")));
     check(await evaluate(control.main, "(()=>{setTimeout(()=>process.getBuiltinModule('inspector').close(),0);return true})()"),
       "install_diagnostic_close_unverified");
     control.main.close();
     control = undefined;
     phase = "replacement";
-    const updated = await replacement(base, oldPid, context.arch, pins);
+    const updated = await replacement(base, candidate, oldPid, context.arch, pins, installObserver);
     control = updated;
     check(updated.installed.cdhash === candidate.cdhash && updated.installed.asarSha256 === candidate.asarSha256,
       "installed_candidate_identity_mismatch", "failed");
@@ -519,6 +788,7 @@ export async function runUpdateVerification(scenario) {
     phase = "preservation";
     await preserved(control, before);
     checks.push("state_preserved");
+    if (pins.version === "1.0.10") await nativeShellCommandRegression(control, before);
     check(await sha256File(files.zip) === artifacts.zip.sha256 && await sha256File(files.base) === artifacts.baseZip.sha256,
       "pinned_archive_changed", "failed");
     status = "passed";
@@ -527,6 +797,7 @@ export async function runUpdateVerification(scenario) {
     status = error instanceof VerificationFailure ? error.kind : "unverified";
     code = error instanceof VerificationFailure ? error.code : "unexpected_harness_error";
   } finally {
+    installObserver?.renderer?.close();
     control?.main.close();
     if (executable) {
       const pids = await findOwnedPids(executable).catch(() => undefined);

@@ -43,6 +43,19 @@ export function genuineQuarantineRead(result, startedMs, nowMs = Date.now()) {
   return result.stdout.trim();
 }
 
+export function verifyQuarantineInheritance(source, installed, startedMs, nowMs = Date.now()) {
+  try { quarantineRecord(source, startedMs, nowMs); quarantineRecord(installed, startedMs, nowMs); }
+  catch { throw new VerificationFailure("unverified", "installed_quarantine_unverified"); }
+  const original = source.trim().split(";"), copied = installed.trim().split(";");
+  const originalTime = Number.parseInt(original[1], 16) * 1000;
+  const copiedTime = Number.parseInt(copied[1], 16) * 1000;
+  // Finder may create a new quarantine event identifier. Require the same
+  // browser agent and download/copy time context, not byte-identical UUIDs.
+  check(copied[2] === original[2] && copiedTime >= originalTime - 60000 && copiedTime <= nowMs + 60000,
+    "installed_quarantine_context_mismatch");
+  return true;
+}
+
 async function approveNormalOpen(application) {
   // Only the ordinary, exact-name Open/Cancel confirmation is eligible. This
   // does not click "Open Anyway", grant TCC, or change a security setting.
@@ -201,7 +214,7 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
     const after = await lstat(original);
     const unchangedQuarantine = (await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", original])).stdout.trim();
     check(sameBrowserFile(before, after, quarantine, unchangedQuarantine), "browser_inode_or_quarantine_changed");
-    return { dmg: original, pid };
+    return { dmg: original, pid, quarantine, started, identity: after };
   } finally {
     stopBegin(); stopProgress(); page.close();
   }
@@ -274,17 +287,29 @@ export async function verifyInstall() {
     const mountedIdentity = await verifyApp(sourceApp, { pins, arch: context.arch });
     check(mountedIdentity.cdhash === expected.cdhash && mountedIdentity.asarSha256 === expected.asarSha256,
       "zip_dmg_app_mismatch", "failed");
-    await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", sourceApp], { code: "mounted_quarantine_unverified" });
+    // A read-only image's contents need not carry a physical bundle xattr.
+    // Apple DTS describes the DMG -> Finder copy -> Gatekeeper inheritance
+    // chain; the installed copy below remains a mandatory quarantine gate.
+    const mountedAttribute = await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", sourceApp], { allowFailure: true, maxBytes: 4096 });
+    console.log(JSON.stringify({ schemaVersion: 1, check: "mounted_quarantine", ...quarantineReadObservation(mountedAttribute, downloaded.started) }));
     record.checks.push("mounted_app");
     await assertAbsent(INSTALLED_APP);
     observePhase("finder_install");
+    const originalAttribute = await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", downloaded.dmg], { allowFailure: true, maxBytes: 4096 });
+    console.log(JSON.stringify({ schemaVersion: 1, check: "source_dmg_quarantine", ...quarantineReadObservation(originalAttribute, downloaded.started) }));
+    check(originalAttribute.exitCode === 0 && sameBrowserFile(downloaded.identity, await lstat(downloaded.dmg),
+      downloaded.quarantine, originalAttribute.stdout.trim()) && await sha256File(downloaded.dmg) === artifact.dmg.sha256,
+      "source_dmg_or_quarantine_changed");
     await run("/usr/bin/osascript", ["-e", `tell application "Finder" to duplicate POSIX file ${JSON.stringify(sourceApp)} to POSIX file "/Applications"`],
       { env: applicationEnvironment(), code: "finder_install_unverified" });
     observePhase("installed_verify");
     const installed = await verifyApp(INSTALLED_APP, { pins, arch: context.arch });
     check(installed.cdhash === expected.cdhash && installed.asarSha256 === expected.asarSha256,
       "finder_installed_app_mismatch", "failed");
-    await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", INSTALLED_APP], { code: "installed_quarantine_unverified" });
+    const installedAttribute = await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", INSTALLED_APP], { allowFailure: true, maxBytes: 4096 });
+    console.log(JSON.stringify({ schemaVersion: 1, check: "installed_quarantine", ...quarantineReadObservation(installedAttribute, downloaded.started) }));
+    check(installedAttribute.exitCode === 0, "installed_quarantine_unverified");
+    verifyQuarantineInheritance(downloaded.quarantine, installedAttribute.stdout, downloaded.started);
     record.checks.push("finder_install");
     await run("/usr/bin/hdiutil", ["detach", mount]); mounted = false;
     const port = await unusedPort();

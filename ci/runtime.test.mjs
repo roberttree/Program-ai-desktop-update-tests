@@ -17,14 +17,14 @@ function facts(arch = "arm64") {
       GITHUB_TRIGGERING_ACTOR: "roberttree", GITHUB_RUN_ID: "1234", GITHUB_SHA: "a".repeat(40) },
   };
 }
-function artifact(arch, extension, version = "1.0.9") {
+function artifact(arch, extension, version = "1.0.10") {
   const name = `Program-AI-Desktop-mac-${arch}.${extension}`;
   return { name, bytes: 1024, sha256: hash, url: `https://github.com/${PUBLIC_REPOSITORY}/releases/download/v${version}/${name}` };
 }
 function pins() {
-  return { schemaVersion: 1, repository: PUBLIC_REPOSITORY, version: "1.0.9", baseVersion: "1.0.8",
+  return { schemaVersion: 1, repository: PUBLIC_REPOSITORY, version: "1.0.10", baseVersion: "1.0.8",
     teamId: "LH2479Y2F4", bundleId: "com.programai.desktop",
-    source: { repository: "roberttree/Program-ai-desktop", commit: "a".repeat(40), tag: "program-ai-desktop-v1.0.9", tagObject: "b".repeat(40) },
+    source: { repository: "roberttree/Program-ai-desktop", commit: "a".repeat(40), tag: "program-ai-desktop-v1.0.10", tagObject: "b".repeat(40) },
     artifacts: Object.fromEntries(["arm64", "x64"].map((arch) => [arch, {
       dmg: artifact(arch, "dmg"), zip: artifact(arch, "zip"), zipBlockmap: artifact(arch, "zip.blockmap"), baseZip: artifact(arch, "zip", "1.0.8"),
     }])) };
@@ -102,7 +102,7 @@ test("owner workstation, spoofed HOME, private repository, PR and non-owner cont
 });
 
 test("candidate metadata identifies both exact archives, DMGs, blockmaps and previous signed version", () => {
-  assert.equal(validatePins(pins()).version, "1.0.9");
+  assert.equal(validatePins(pins()).version, "1.0.10");
   for (const key of ["version", "baseVersion", "teamId", "bundleId", "repository"]) {
     const value = pins(); value[key] = "invalid";
     failure(() => validatePins(value), "candidate_identity_invalid");
@@ -118,10 +118,10 @@ test("artifact URL and byte pins reject private-source downloads, secret URLs an
   for (const url of [value.url.replace("https:", "http:"), value.url + "?token=private", value.url + "#fragment",
     value.url.replace("github.com", "github.com.evil.invalid"), value.url.replace(PUBLIC_REPOSITORY, "roberttree/Program-ai-desktop"),
     value.url.replace("github.com", "user:password@github.com")]) {
-    failure(() => validateArtifact({ ...value, url }, "arm64", "dmg", "1.0.9"), "artifact_url_invalid");
+    failure(() => validateArtifact({ ...value, url }, "arm64", "dmg", "1.0.10"), "artifact_url_invalid");
   }
   for (const patch of [{ bytes: 0 }, { bytes: 513 * 1024 * 1024 }, { sha256: "invalid" }, { name: "../file.dmg" }])
-    failure(() => validateArtifact({ ...value, ...patch }, "arm64", "dmg", "1.0.9"), "artifact_pin_invalid");
+    failure(() => validateArtifact({ ...value, ...patch }, "arm64", "dmg", "1.0.10"), "artifact_pin_invalid");
 });
 
 test("redirects admit only GitHub's bounded HTTPS artifact hosts and diagnostic sockets only loopback", () => {
@@ -169,8 +169,12 @@ test("architecture policy permits only the exact paired, pinned conditional msgp
     previous.resources[0].binarySha256 = arch === "arm64" ? "f4f350b4fcbadd64759f639989e42de84cc099658f79817311fd11479810c56f" : "d916b8c89dcfb91d0fe66281a7b33fbe453b182eb6a4759b40aec0b3d4464450";
     previous.resources[1].binarySha256 = arch === "arm64" ? "5647133ba13f3046bd2fd4550f75a603e43f535c23f33d1bea0f011f4f1f8af9" : "b87080295249b4863652366929a54fa1d198058978a8414194e88d8ad843532f";
     assert.equal(validateMachOInventory(previous), true);
+    const current = nativeInventory(arch); current.version = "1.0.10";
+    current.resources[0].binarySha256 = arch === "arm64" ? "66e1650211b7638b7d5523efec587362c423c274a1bfb4c413707827d86a5092" : "d4fa4e6dea93f0d6ff2ce7caabafd0667a06f02bd413c0d655c3baf14252151f";
+    current.resources[1].binarySha256 = arch === "arm64" ? "76a2731f1ec90b1072aa603ea8b906405f08bf1712772016fafeba4dfa3f6a54" : "72756bc219d3f9a283bf65195aa4cea000288ae885f889df5ca4be1bbfe3855f";
+    assert.equal(validateMachOInventory(current), true);
   }
-  const unreviewed = nativeInventory(); unreviewed.version = "1.0.10";
+  const unreviewed = nativeInventory(); unreviewed.version = "1.0.11";
   failure(() => validateMachOInventory(unreviewed), "optional_resource_version_unreviewed");
   const crossVersion = nativeInventory(); crossVersion.version = "1.0.8";
   failure(() => validateMachOInventory(crossVersion), "optional_resource_hash_mismatch");

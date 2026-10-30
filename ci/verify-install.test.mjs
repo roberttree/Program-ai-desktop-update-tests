@@ -1,7 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { chromeLaunchArguments, firstLaunchObservation, launchFailureCode, normalDownloadPreferences, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+import { chromeLaunchArguments, firstLaunchObservation, launchFailureCode, normalDownloadPreferences, normalOpenDialog, sameBrowserFile, validDownloadEvent, verifyQuarantineInheritance } from "./verify-install.mjs";
+
+test("Finder-installed copy requires genuine matching browser/time context but may have a new quarantine UUID", () => {
+  const now = 1800000000000;
+  const timestamp = Math.floor(now / 1000).toString(16);
+  const source = `0083;${timestamp};Google Chrome;12345678-1234-1234-1234-123456789abc`;
+  const copied = source.replace("12345678-1234-1234-1234-123456789abc", "87654321-1234-1234-1234-cba987654321");
+  assert.equal(verifyQuarantineInheritance(source, copied, now, now), true);
+  assert.equal(verifyQuarantineInheritance(source, copied.replace("0083", "0081"), now, now), true);
+  for (const invalid of ["", copied.replace("0083", "0000"), copied.replace("Google Chrome", "Finder"),
+    copied.replace(timestamp, "00000001"), copied.replace("87654321", "invalid")])
+    assert.throws(() => verifyQuarantineInheritance(source, invalid, now, now), { code: "installed_quarantine_unverified" });
+  assert.throws(() => verifyQuarantineInheritance(source, copied.replace("Google Chrome", "Chrome"), now, now), { code: "installed_quarantine_context_mismatch" });
+});
 
 test("normal download preferences target only the fresh CI-owned Downloads directory without security preferences", () => {
   const directory = "/Users/runner/Downloads/program-ai-verification-a1B2c3";
@@ -102,6 +115,12 @@ test("the actual driver guards first, proves ZIP app trust before Chrome, and ne
   assert.ok(browser.indexOf("normalDownloadPreferences(downloads)") < browser.indexOf("startHeadfulChrome("));
   assert.ok(browser.indexOf("completed && begun") < browser.indexOf("await sha256File(original)"));
   assert.match(browser, /genuineQuarantineRead\(attribute, started\)/);
+  assert.doesNotMatch(source, /mounted_quarantine_unverified/);
+  assert.match(flow, /check: "mounted_quarantine"/);
+  assert.match(flow, /sameBrowserFile\(downloaded\.identity/);
+  assert.match(flow, /source_dmg_or_quarantine_changed/);
+  assert.ok(flow.indexOf("verifyQuarantineInheritance(downloaded.quarantine") < flow.indexOf('run("/usr/bin/open", ["-n", "-a", INSTALLED_APP'));
+  assert.match(flow, /check\(installedAttribute\.exitCode === 0, "installed_quarantine_unverified"\)/);
   assert.doesNotMatch(source, /xattr[^\n]*(?:-d|-c|-w)|spctl[^\n]*(?:--master-disable|--disable)|tccutil|fuses\.write|\.updater\.install|chat\/completions/);
   assert.doesNotMatch(flow, /press\(.?Enter|key.?\s*:\s*.Enter/);
 });
