@@ -1,5 +1,6 @@
 import { lstat, mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -102,7 +103,7 @@ export function inspectNormalOpenAgent(agent, application, classify, errorFlags,
     observed.agentPresent = true;
     const windows = agent.windows(); observed.windowCount = Math.min(windows.length, 16);
     if (windows.length !== 1) { observed.querySucceeded = true; observed.status = "window_count"; return observed; }
-    const text = [], buttons = [], open = []; let visited = 0;
+    const text = [], buttons = [], open = [], privateExtraButtons = []; let visited = 0;
     const visit = (node, depth) => {
       if (++visited > 256 || depth > 10) throw new Error("bounded");
       const role = node.role();
@@ -122,12 +123,31 @@ export function inspectNormalOpenAgent(agent, application, classify, errorFlags,
         }
         text.push(value);
       }
-      if (role === "AXButton") { const name = node.name(); buttons.push(name); if (name === "Open") open.push(node); }
+      if (role === "AXButton") {
+        const name = node.name(); buttons.push(name); if (name === "Open") open.push(node);
+        if (name !== "Open" && name !== "Cancel") {
+          let subrole;
+          try { const attribute = node.attributes?.byName("AXSubrole"); if (attribute?.exists()) subrole = attribute.value(); }
+          catch (error) { const flags = failure(error); if (!flags.attributeUnavailable || flags.automationDenied || flags.accessibilityDenied) throw error; }
+          if (privateExtraButtons.length < 16) privateExtraButtons.push({
+            nameKind: typeof name !== "string" ? "missing" : name.length === 0 ? "empty" : "nonempty",
+            nameLength: typeof name === "string" ? Math.min(64, name.length) : 0,
+            nameTooLong: typeof name === "string" && name.length > 64,
+            subrole: subrole === "AXHelpButton" ? "AXHelpButton" : subrole === undefined || subrole === null || subrole === "" ? "missing" : "other",
+            // Private osascript -> Node RAM only. The public projection hashes
+            // this bounded name and never emits the label or other AX text.
+            ...(typeof name === "string" && name.length <= 64 ? { label: name } : {}),
+          });
+        }
+      }
       node.uiElements().forEach((child) => visit(child, depth + 1));
     };
     visit(windows[0], 0);
     observed.buttonCount = Math.min(buttons.length, 16); observed.openButtonCount = Math.min(open.length, 16);
     Object.assign(observed, buttonFacts(buttons));
+    observed.privateExtraButtons = privateExtraButtons;
+    if (observed.extraButtonCategory === "unknown" && privateExtraButtons.length === 1 && privateExtraButtons[0].subrole === "AXHelpButton")
+      observed.extraButtonCategory = "ax_help_button";
     const words = text.filter((item) => bounded(item)).join(" ");
     observed.expectedApplication = text.some((item) => bounded(item) && item.includes(application));
     observed.downloadedWarning = /downloaded from the internet/i.test(words);
@@ -162,7 +182,14 @@ export function normalOpenQueryDiagnostic(result) {
   if (output.automationDenied || output.accessibilityDenied) { output.status = "access_denied"; output.querySucceeded = false; }
   for (const name of ["windowCount", "staticTextCount", "valueAvailableCount", "nameFallbackCount", "unreadableTextCount", "buttonCount", "openButtonCount", "cancelButtonCount", "extraButtonCount"])
     output[name] = Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
-  output.extraButtonCategory = ["none", "multiple", "show_web_page", "help", "question_mark", "unknown"].includes(value.extraButtonCategory) ? value.extraButtonCategory : "unknown";
+  output.extraButtonCategory = ["none", "multiple", "show_web_page", "help", "question_mark", "ax_help_button", "unknown"].includes(value.extraButtonCategory) ? value.extraButtonCategory : "unknown";
+  output.extraButtons = (Array.isArray(value.privateExtraButtons) ? value.privateExtraButtons : []).slice(0, 16).map((button) => ({
+    nameKind: ["empty", "nonempty", "missing"].includes(button?.nameKind) ? button.nameKind : "missing",
+    nameLength: Number.isInteger(button?.nameLength) && button.nameLength >= 0 ? Math.min(64, button.nameLength) : 0,
+    nameTooLong: button?.nameTooLong === true,
+    subrole: ["AXHelpButton", "other", "missing"].includes(button?.subrole) ? button.subrole : "missing",
+    labelSha256: typeof button?.label === "string" && button.label.length <= 64 ? createHash("sha256").update(button.label).digest("hex") : null,
+  }));
   output.approved = result.exitCode === 0 && output.querySucceeded && output.status === "approved" && value.approved === true &&
     output.classifierMatched && output.windowCount === 1 && output.buttonCount === 2 && output.openButtonCount === 1 &&
     output.cancelButtonCount === 1 && output.extraButtonCount === 0 && output.extraButtonCategory === "none";

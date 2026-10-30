@@ -549,6 +549,66 @@ async function ready(control) {
   }, { timeoutMs: 90000, code: "signed_out_preload_unavailable" });
 }
 
+export async function rendererReadySnapshot(api, document) {
+  const preload = { awaitInitialization: typeof api?.awaitInitialization === "function", updaterCheck: typeof api?.updater?.check === "function",
+    updaterInstall: typeof api?.updater?.install === "function", storeSet: typeof api?.storeSet === "function",
+    storeGet: typeof api?.storeGet === "function", authGetState: typeof api?.programAICloudAuth?.getState === "function" };
+  const result = { apiPresent: api !== null && typeof api === "object", preload, documentMeaningful: typeof document?.body?.innerText === "string" && document.body.innerText.trim().length > 20,
+    authStatus: "unknown", authReason: "function_missing" };
+  if (!preload.authGetState) return result;
+  let timer;
+  try {
+    const observed = await Promise.race([
+      Promise.resolve().then(() => api.programAICloudAuth.getState()).then((state) => ({ kind: "state", state }), () => ({ kind: "rejected" })),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ kind: "timeout" }), 2000); }),
+    ]);
+    if (observed.kind !== "state") return { ...result, authReason: observed.kind === "timeout" ? "timeout" : "request_failed" };
+    const state = observed.state;
+    const authStatus = ["signed_out", "signed_in", "unavailable", "error"].includes(state?.status) ? state.status :
+      ["signing_in", "authenticating"].includes(state?.status) ? "authenticating" : "unknown";
+    const authReason = authStatus === "unavailable" ? ["configuration", "secure_storage"].includes(state.reason) ? state.reason : "unknown" :
+      authStatus === "error" ? "auth_error" : authStatus === "unknown" ? "unknown" : "none";
+    return { ...result, authStatus, authReason };
+  } finally { clearTimeout(timer); }
+}
+
+export function readyPhaseObservation(value = {}) {
+  const count = (name) => Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
+  const preload = {};
+  for (const name of ["awaitInitialization", "updaterCheck", "updaterInstall", "storeSet", "storeGet", "authGetState"]) preload[name] = value.preload?.[name] === true;
+  return { diagnosticStatus: value.mainAttested === true ? "observed" : "unavailable", mainAttested: value.mainAttested === true,
+    allWindowCount: count("allWindowCount"), visibleWindowCount: count("visibleWindowCount"),
+    programRendererWindowCount: count("programRendererWindowCount"), visibleProgramRendererCount: count("visibleProgramRendererCount"),
+    windowCountsSaturated: value.windowCountsSaturated === true, rendererChecked: value.rendererChecked === true, apiPresent: value.apiPresent === true, preload,
+    documentMeaningful: value.documentMeaningful === true,
+    authStatus: ["signed_out", "signed_in", "unavailable", "authenticating", "error", "unknown"].includes(value.authStatus) ? value.authStatus : "unknown",
+    authReason: ["none", "configuration", "secure_storage", "auth_error", "unknown", "function_missing", "timeout", "request_failed"].includes(value.authReason) ? value.authReason : "unknown" };
+}
+
+async function mainReadySnapshot(expected, rendererSnapshot) {
+  const require = process.getBuiltinModule("module").createRequire(process.resourcesPath + "/app.asar/package.json");
+  const electron = require("electron");
+  if (process.pid !== expected.pid || process.execPath !== expected.executable || process.resourcesPath !== expected.resources ||
+    !electron.app.isPackaged || electron.app.getVersion() !== expected.version) throw new Error("owned_scope_required");
+  const all = electron.BrowserWindow.getAllWindows();
+  const visible = all.filter((window) => !window.isDestroyed() && window.isVisible());
+  const program = all.filter((window) => !window.isDestroyed() && !window.webContents.isDestroyed() && window.webContents.getURL().startsWith("program-ai://renderer/"));
+  const selected = program.filter((window) => window.isVisible());
+  const counts = { mainAttested: true, allWindowCount: Math.min(16, all.length), visibleWindowCount: Math.min(16, visible.length),
+    programRendererWindowCount: Math.min(16, program.length), visibleProgramRendererCount: Math.min(16, selected.length),
+    windowCountsSaturated: [all, visible, program, selected].some((windows) => windows.length > 16), rendererChecked: false };
+  if (selected.length !== 1) return counts;
+  try { return { ...counts, ...await selected[0].webContents.executeJavaScript(`(${rendererSnapshot.toString()})(window.api,document)`, true), rendererChecked: true }; }
+  catch { return counts; }
+}
+
+async function reportReadyFailure(control) {
+  let value;
+  try { value = await evaluate(control.main, `(${mainReadySnapshot.toString()})(${JSON.stringify(control.expected)},(${rendererReadySnapshot.toString()}))`, 5000); }
+  catch { value = {}; }
+  console.log(JSON.stringify({ schemaVersion: 1, check: "ready_phase_diagnostics", ...readyPhaseObservation(value) }));
+}
+
 async function sidecar(control) {
   const connection = await windowValue(control, "window.api.awaitInitialization()", 90000);
   const url = loopbackUrl(connection?.url);
@@ -1032,6 +1092,7 @@ export async function runUpdateVerification(scenario) {
     status = error instanceof VerificationFailure ? error.kind : "unverified";
     code = error instanceof VerificationFailure ? error.code : "unexpected_harness_error";
   } finally {
+    if (status !== "passed" && code === "signed_out_preload_unavailable" && control) await reportReadyFailure(control);
     // Capture the actual pre-cleanup child exit, never a SIGTERM sent by this
     // harness's later owned-process cleanup. No raw stderr is published.
     const handoff = installObserver?.handoff ?? control?.handoff;
