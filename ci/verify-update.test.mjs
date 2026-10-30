@@ -7,12 +7,64 @@ import test from "node:test";
 import {
   SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
   createInstallPromiseObserver, createNativeSignatureObserver, installPromiseObservation, nativeShellCommandFixture, payloadChunk,
-  rejectionOutcome, replacementObservation, shellSeedObservation, signatureInstallOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
+  rejectionOutcome, replacementObservation, shellSeedObservation, shipItDiagnosticObservation, shipItLogObservation, shipItReadPlan,
+  shipItStateObservation, signatureInstallOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
 
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
 const state = () => ({ marker: "synthetic\n", store: "unsent canary", session: "session_synthetic_1",
   title: "Synthetic shell chat", messages: ["message_1", "message_2"], signedOut: true });
+
+test("ShipIt log read policy admits only new appended bytes and refuses replaced/truncated/unsafe prior files", () => {
+  const before = { status: "owned", dev: 1, ino: 2, size: 100, mtimeMs: 1, ctimeMs: 1 };
+  const after = { ...before, size: 70000 };
+  assert.deepEqual(shipItReadPlan(before, after), { status: "observed", start: 4464, length: 65536, tailTruncated: true });
+  assert.equal(shipItReadPlan(before, before).status, "unchanged");
+  assert.equal(shipItReadPlan(before, { ...after, ino: 3 }).status, "replaced");
+  assert.equal(shipItReadPlan(before, { ...before, size: 99 }).status, "truncated");
+  assert.equal(shipItReadPlan({ status: "unsafe" }, after).status, "baseline_unavailable");
+  assert.equal(shipItReadPlan(before, { status: "unsafe" }).status, "unsafe");
+  assert.equal(shipItReadPlan({ status: "absent" }, { ...after, size: 9 * 1024 * 1024 }).status, "size_limit");
+  assert.equal(shipItReadPlan(before, before, true).status, "unchanged");
+  assert.equal(shipItReadPlan(before, { ...before, ino: 3, size: 500 }, true).status, "observed");
+  assert.equal(shipItReadPlan(before, after, true).status, "size_limit");
+});
+
+test("ShipIt tail classifier emits only known marker booleans and bounded installer enums, never free text", () => {
+  const text = 'privateURL?token=secret Error Domain=SQRLInstallerErrorDomain Code=-3 private/path\nSQRLInstallerErrorDomain error -9\nSQRLInstallerErrorDomain Code=-10\nMoving bundle from private/path to other\n';
+  const result = shipItLogObservation([text, "Could not read update request private secret"]);
+  assert.deepEqual(result.installerCodes, [-9, -3]);
+  assert.equal(result.bundleMoveStarted, true);
+  assert.equal(result.requestReadError, true);
+  assert.doesNotMatch(JSON.stringify(result), /private|URL|token|secret|path/);
+  assert.equal(shipItLogObservation(["unknown private failure"]).unknownTextSeen, true);
+  assert.equal(shipItLogObservation(["SQRLInstallerErrorDomain Code=-1" + "x".repeat(70000)]).installerCodes.length, 0);
+  const phases = shipItLogObservation(["Detected this as an install request\nBeginning installation\nInstallation error: private/path\nShipIt quitting",
+    "Detected this as a launch request\nCould not launch application at secretURL"]);
+  assert.equal(phases.installRequestMarker, true);
+  assert.equal(phases.installationBeginMarker, true);
+  assert.equal(phases.installationErrorMarker, true);
+  assert.equal(phases.launchFailureMarker, true);
+  assert.equal(phases.launchSuccessMarker, false);
+  assert.equal(phases.installationCompletedMarker, false);
+  assert.equal(phases.unknownTextSeen, false);
+  assert.doesNotMatch(JSON.stringify(phases), /private|path|secretURL/);
+});
+
+test("ShipIt JSON projection binds target to the owned base and emits no URL or extra state keys", () => {
+  const target = "/Users/runner/work/_temp/public-native-update-a1B2c3/installation/Program AI Desktop.app";
+  const result = shipItStateObservation(JSON.stringify({ targetBundleURL: "file://" + target.replaceAll(" ", "%20"),
+    updateBundleURL: "file:///private/staged.app", bundleIdentifier: "com.programai.desktop", launchAfterInstallation: true,
+    useUpdateBundleName: false, secret: "never emitted" }), target);
+  assert.deepEqual(result, { jsonValid: true, targetMatches: true, bundleMatches: true, localUpdate: true, launchAfterInstallation: true, useUpdateBundleName: false });
+  assert.doesNotMatch(JSON.stringify(result), /Users|private|file:|secret|emitted/);
+  assert.equal(shipItStateObservation('{"targetBundleURL":"https://private.invalid"}', target).targetMatches, false);
+  assert.equal(shipItStateObservation("x".repeat(65537), target).jsonValid, false);
+  const scrubbed = shipItDiagnosticObservation({ ...result, files: { stderr: { status: "raw private error", tailTruncated: true } }, logs: { installerCodes: [-1, -99, "secret", -1], raw: "private" }, state: result });
+  assert.deepEqual(scrubbed.logs.installerCodes, [-1]);
+  assert.equal(scrubbed.files.stderr.status, "unavailable");
+  assert.doesNotMatch(JSON.stringify(scrubbed), /raw|private|secret|99/);
+});
 
 test("actual install promise observer captures resolution/rejection without raw errors or mutable snapshot inference", async () => {
   const resolved = createInstallPromiseObserver(() => Promise.resolve());
@@ -319,6 +371,23 @@ test("public case receipt is deliberately narrower than paid coding or editor re
     sourceCommit: "secret source URL" }), { code: "case_receipt_identity_invalid" });
 });
 
+test("signature restart schedules owned inspector teardown before normal quit and detaches before PID wait", async () => {
+  const source = await readFile(new URL("./verify-update.mjs", import.meta.url), "utf8");
+  const quit = source.slice(source.indexOf("function quitOwnedBase("), source.indexOf("export function validatePreservation("));
+  assert.match(quit, /process\.pid !== expected\.pid/);
+  assert.match(quit, /electron\.app\.getVersion\(\) !== expected\.version/);
+  assert.ok(quit.indexOf("setTimeout(() => {") < quit.indexOf('process.getBuiltinModule("inspector").close()'));
+  assert.ok(quit.indexOf('process.getBuiltinModule("inspector").close()') < quit.indexOf("electron.app.quit()"));
+  assert.match(quit, /\}, 150\);\s+return true/);
+  const restart = source.slice(source.indexOf('phase = "signature_restart";'), source.indexOf('phase = "positive_download";'));
+  assert.ok(restart.indexOf("await evaluate(control.main, mainExpression(quitOwnedBase, control.expected))") < restart.indexOf("control.main.close()"));
+  assert.ok(restart.indexOf("control.main.close()") < restart.indexOf("await waitFor("));
+  assert.match(restart, /base\.asarSha256/);
+  assert.match(restart, /startBase\(base, context\.arch, pins\.baseVersion, feed\.url/);
+  assert.match(restart, /await preserved\(control, before\)/);
+  assert.doesNotMatch(quit + restart, /quitAndInstall|pending\s*=|squirrelDownloadedUpdate\s*=/);
+});
+
 test("live entrypoint remains CI-gated and never uses source imports, global kills or security bypasses", async () => {
   const source = await readFile(new URL("./verify-update.mjs", import.meta.url), "utf8");
   assert.ok(source.indexOf("await requireCiContext(pins)") < source.indexOf("await ensureFreshHost(pins)"));
@@ -340,6 +409,11 @@ test("live entrypoint remains CI-gated and never uses source imports, global kil
   assert.ok(source.indexOf("await verifyNativeSignatureRejection(control, base, before, traffic)") < source.indexOf('phase = "signature_restart"'));
   const nativeObserver = source.slice(source.indexOf("export function createNativeSignatureObserver("), source.indexOf("export function signatureInstallOutcome("));
   assert.doesNotMatch(nativeObserver, /\.emit\(|checkForUpdates|quitAndInstall|setFeedURL|preventDefault|\.message/);
+  const shipItReader = source.slice(source.indexOf("async function shipItCacheOwned("), source.indexOf("export function replacementObservation("));
+  assert.match(shipItReader, /constants\.O_RDONLY \| constants\.O_NOFOLLOW/);
+  assert.doesNotMatch(shipItReader, /writeFile|appendFile|unlink|rm\(|launchctl|\.chmod\(|\.chown\(/);
+  assert.ok(source.indexOf("shipIt: await captureShipItBaseline(base)") < source.indexOf('replacementProbeExpression("schedule")'));
+  assert.match(source, /logs: shipItLogObservation\(\[files\.stderr\.text \?\? "", files\.stdout\.text \?\? ""\]\)/);
   assert.doesNotMatch(source, /console\.(?:error|log)\(error|JSON\.stringify\(connection|Authorization.*console/);
   assert.match(source, /installObserver\.last = installPromiseObservation/);
   assert.match(source, /targetType: "page", executable: base\.executable/);

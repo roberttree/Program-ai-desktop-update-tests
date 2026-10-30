@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, stat } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -195,7 +195,12 @@ function quitOwnedBase(expected) {
   const electron = require("electron");
   if (process.pid !== expected.pid || process.execPath !== expected.executable || process.resourcesPath !== expected.resources ||
     !electron.app.isPackaged || electron.app.getVersion() !== expected.version) throw new Error("owned_scope_required");
-  setTimeout(() => electron.app.quit(), 150);
+  // Schedule after this RPC can reply. The owned inspector must close before
+  // normal quit, otherwise Node can wait for its diagnostic client to detach.
+  setTimeout(() => {
+    process.getBuiltinModule("inspector").close();
+    electron.app.quit();
+  }, 150);
   return true;
 }
 
@@ -591,6 +596,135 @@ export function installPromiseObservation(value) {
   return { outcome: value.outcome, errorClass: value.errorClass };
 }
 
+const SHIPIT_CACHE = "/Users/runner/Library/Caches/com.programai.desktop.ShipIt";
+const SHIPIT_FILES = Object.freeze({ stderr: "ShipIt_stderr.log", stdout: "ShipIt_stdout.log", state: "ShipItState.plist" });
+const SHIPIT_TAIL_BYTES = 65536;
+const SHIPIT_FILE_LIMIT = 8 * 1024 * 1024;
+const SHIPIT_READ_STATUSES = ["observed", "absent", "unchanged", "unsafe", "baseline_unavailable", "replaced", "truncated", "size_limit", "unavailable"];
+// Squirrel source pinned by Electron42: 0e5d146b, Squirrel/ShipIt-main.m.
+const SHIPIT_LOG_MARKERS = Object.freeze({ installRequestMarker: "Detected this as an install request",
+  installationBeginMarker: "Beginning installation", installationResumeMarker: "Resuming installation attempt ",
+  installationCompletedMarker: "Installation completed successfully", attemptsExhaustedMarker: "Too many attempts to install, aborting update",
+  installationErrorMarker: "Installation error:", launchRequestMarker: "Detected this as a launch request",
+  launchFailureMarker: "Could not launch application at ", launchSuccessMarker: "Successfully launched application at ",
+  missingTargetMarker: "Missing target bundle URL, cannot launch application", newShipItExitedMarker: "New ShipIt exited", quitMarker: "ShipIt quitting" });
+
+// Pure metadata policy. Logs count only bytes appended after the pre-install
+// offset, never old content in a cache that this harness did not prove absent.
+export function shipItReadPlan(before, after, state = false) {
+  const refuse = (status) => ({ status, start: 0, length: 0, tailTruncated: false });
+  if (!["absent", "owned"].includes(before?.status)) return refuse("baseline_unavailable");
+  if (after?.status !== "owned") return refuse(after?.status === "absent" ? "absent" : "unsafe");
+  if (!Number.isSafeInteger(after.size) || after.size < 0 || after.size > (state ? SHIPIT_TAIL_BYTES : SHIPIT_FILE_LIMIT)) return refuse("size_limit");
+  if (state) {
+    if (before.status === "owned" && before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs) return refuse("unchanged");
+    return { status: "observed", start: 0, length: after.size, tailTruncated: false };
+  }
+  if (before.status === "owned" && (before.dev !== after.dev || before.ino !== after.ino)) return refuse("replaced");
+  const offset = before.status === "owned" ? before.size : 0;
+  if (!Number.isSafeInteger(offset) || offset < 0 || after.size < offset) return refuse("truncated");
+  if (after.size === offset) return refuse("unchanged");
+  const start = Math.max(offset, after.size - SHIPIT_TAIL_BYTES);
+  return { status: "observed", start, length: after.size - start, tailTruncated: start > offset };
+}
+
+export function shipItStateObservation(text, target) {
+  const result = { jsonValid: false, targetMatches: false, bundleMatches: false, localUpdate: false,
+    launchAfterInstallation: false, useUpdateBundleName: false };
+  if (typeof text !== "string" || Buffer.byteLength(text) > SHIPIT_TAIL_BYTES) return result;
+  try {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+    result.jsonValid = true;
+    const local = (raw) => { const url = new URL(raw); return url.protocol === "file:" && !url.hostname && !url.username && !url.password && !url.port && !url.search && !url.hash ? fileURLToPath(url) : undefined; };
+    result.targetMatches = typeof value.targetBundleURL === "string" && local(value.targetBundleURL) === target;
+    result.bundleMatches = value.bundleIdentifier === "com.programai.desktop";
+    result.localUpdate = typeof value.updateBundleURL === "string" && typeof local(value.updateBundleURL) === "string";
+    result.launchAfterInstallation = value.launchAfterInstallation === true;
+    result.useUpdateBundleName = value.useUpdateBundleName === true;
+  } catch {}
+  return result;
+}
+
+export function shipItLogObservation(texts) {
+  // Fixed primary-source strings only. These are diagnostic markers, not
+  // installer success/pass gates. Unknown text is never printed or guessed.
+  const source = (Array.isArray(texts) ? texts.slice(0, 2) : []).map((text) =>
+    typeof text === "string" ? Buffer.from(text).subarray(-SHIPIT_TAIL_BYTES).toString("utf8") : "").join("\n");
+  const installerCodes = [...new Set([...source.matchAll(/\bSQRLInstallerErrorDomain\s+(?:Code=|error\s+)(-[1-9])\b/g)].map((match) => Number(match[1])))].sort((a, b) => a - b);
+  const result = { installerCodes, installerDomainSeen: source.includes("SQRLInstallerErrorDomain"),
+    signatureDomainSeen: source.includes("SQRLCodeSignatureErrorDomain"), requestReadError: source.includes("Could not read update request"),
+    requestWriteError: source.includes("Could not write update request"), bundleMoveStarted: source.includes("Moving bundle from "),
+    bundleMoveCompleted: source.includes("Moved bundle contents from "), rollbackError: source.includes("Couldn't abort install and restore owned bundle") };
+  for (const [name, marker] of Object.entries(SHIPIT_LOG_MARKERS)) result[name] = source.includes(marker);
+  return { ...result, unknownTextSeen: source.trim().length > 0 && installerCodes.length === 0 && !Object.values(result).some((value) => value === true) };
+}
+
+export function shipItDiagnosticObservation(value = {}) {
+  const files = {};
+  for (const kind of Object.keys(SHIPIT_FILES)) files[kind] = { status: SHIPIT_READ_STATUSES.includes(value.files?.[kind]?.status) ? value.files[kind].status : "unavailable", tailTruncated: value.files?.[kind]?.tailTruncated === true };
+  const logs = { installerCodes: Array.isArray(value.logs?.installerCodes) ? [...new Set(value.logs.installerCodes.filter((code) => Number.isInteger(code) && code >= -9 && code <= -1))].sort((a, b) => a - b) : [] };
+  for (const name of ["installerDomainSeen", "signatureDomainSeen", "requestReadError", "requestWriteError", "bundleMoveStarted", "bundleMoveCompleted", "rollbackError", "unknownTextSeen", ...Object.keys(SHIPIT_LOG_MARKERS)]) logs[name] = value.logs?.[name] === true;
+  const state = {};
+  for (const name of ["jsonValid", "targetMatches", "bundleMatches", "localUpdate", "launchAfterInstallation", "useUpdateBundleName"]) state[name] = value.state?.[name] === true;
+  return { baselineRecorded: value.baselineRecorded === true, cacheWasAbsent: value.cacheWasAbsent === true, cacheOwned: value.cacheOwned === true, cacheAbsent: value.cacheAbsent === true, files, logs, state };
+}
+
+async function shipItCacheOwned() {
+  try {
+    const info = await lstat(SHIPIT_CACHE);
+    return info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid() && await realpath(SHIPIT_CACHE) === SHIPIT_CACHE ? "owned" : "unsafe";
+  } catch (error) { return error.code === "ENOENT" ? "absent" : "unsafe"; }
+}
+
+async function shipItMetadata(name) {
+  try {
+    const info = await lstat(path.join(SHIPIT_CACHE, name));
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid()) return { status: "unsafe" };
+    return { status: "owned", dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
+  } catch (error) { return { status: error.code === "ENOENT" ? "absent" : "unsafe" }; }
+}
+
+async function captureShipItBaseline(base) {
+  const cache = await shipItCacheOwned();
+  const files = {};
+  for (const [kind, name] of Object.entries(SHIPIT_FILES)) files[kind] = cache === "owned" ? await shipItMetadata(name) : { status: cache };
+  return { cache, files, target: path.resolve(base.executable, "../../..") };
+}
+
+async function readShipItFile(kind, baseline) {
+  const name = SHIPIT_FILES[kind];
+  if (!name || !baseline) return { status: "baseline_unavailable", tailTruncated: false };
+  const cache = await shipItCacheOwned();
+  if (cache !== "owned") return { status: cache === "absent" ? "absent" : "unsafe", tailTruncated: false };
+  const metadata = await shipItMetadata(name);
+  const plan = shipItReadPlan(baseline.files[kind], metadata, kind === "state");
+  if (plan.status !== "observed") return { status: plan.status, tailTruncated: false };
+  let handle;
+  try {
+    // Read-only, no symlink traversal, and re-check the same opened inode.
+    handle = await open(path.join(SHIPIT_CACHE, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile() || info.uid !== process.getuid() || info.dev !== metadata.dev || info.ino !== metadata.ino || info.size < metadata.size) return { status: "unsafe", tailTruncated: false };
+    const bytes = Buffer.alloc(plan.length);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, plan.start);
+    if (bytesRead !== plan.length) return { status: "unavailable", tailTruncated: false };
+    return { status: "observed", tailTruncated: plan.tailTruncated, text: bytes.toString("utf8") };
+  } catch { return { status: "unavailable", tailTruncated: false }; }
+  finally { await handle?.close().catch(() => undefined); }
+}
+
+async function readShipItDiagnostics(baseline) {
+  if (!baseline) return shipItDiagnosticObservation();
+  const files = {};
+  for (const kind of Object.keys(SHIPIT_FILES)) files[kind] = await readShipItFile(kind, baseline);
+  const cache = await shipItCacheOwned();
+  return { baselineRecorded: !!baseline, cacheWasAbsent: baseline?.cache === "absent", cacheOwned: cache === "owned", cacheAbsent: cache === "absent",
+    files: Object.fromEntries(Object.entries(files).map(([kind, value]) => [kind, { status: value.status, tailTruncated: value.tailTruncated }])),
+    logs: shipItLogObservation([files.stderr.text ?? "", files.stdout.text ?? ""]),
+    state: shipItStateObservation(files.state.text, baseline?.target) };
+}
+
 export function replacementObservation(value) {
   const count = (name) => Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
   return { install: installPromiseObservation(value.install), oldPidChecked: value.oldPidChecked === true, oldPidAlive: value.oldPidAlive === true,
@@ -599,7 +733,8 @@ export function replacementObservation(value) {
     installedVersion: typeof value.installedVersion === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(value.installedVersion) ? value.installedVersion : null,
     installedCdhashChecked: value.installedCdhashChecked === true, installedAsarChecked: value.installedAsarChecked === true,
     installedCandidateCdhashMatches: value.installedCandidateCdhashMatches === true, installedCandidateAsarMatches: value.installedCandidateAsarMatches === true,
-    installedBaseCdhashMatches: value.installedBaseCdhashMatches === true, installedBaseAsarMatches: value.installedBaseAsarMatches === true };
+    installedBaseCdhashMatches: value.installedBaseCdhashMatches === true, installedBaseAsarMatches: value.installedBaseAsarMatches === true,
+    ...(value.shipIt ? { shipIt: shipItDiagnosticObservation(value.shipIt) } : {}) };
 }
 
 async function readInstallObserver(observer) {
@@ -610,6 +745,7 @@ async function readInstallObserver(observer) {
 
 async function reportReplacement(base, candidate, oldPid, observer) {
   await readInstallObserver(observer);
+  const shipIt = await readShipItDiagnostics(observer.shipIt).catch(() => shipItDiagnosticObservation());
   const basePids = await findOwnedPids(base.executable).catch(() => undefined);
   const candidatePids = await findOwnedPids(candidate.executable).catch(() => undefined);
   const alive = await run("/bin/ps", ["-p", String(oldPid), "-o", "pid="], { allowFailure: true, timeoutMs: 5000, maxBytes: 4096 });
@@ -626,7 +762,7 @@ async function reportReplacement(base, candidate, oldPid, observer) {
     newProcessCount: basePids && candidatePids ? new Set([...basePids, ...candidatePids].filter((pid) => pid !== oldPid)).size : undefined,
     installedVersion, installedCdhashChecked: !!cdhash, installedAsarChecked: !!asar,
     installedCandidateCdhashMatches: !!cdhash && cdhash === candidate.cdhash, installedCandidateAsarMatches: !!asar && asar === candidate.asarSha256,
-    installedBaseCdhashMatches: !!cdhash && cdhash === base.cdhash, installedBaseAsarMatches: !!asar && asar === base.asarSha256,
+    installedBaseCdhashMatches: !!cdhash && cdhash === base.cdhash, installedBaseAsarMatches: !!asar && asar === base.asarSha256, shipIt,
   }) }));
 }
 
@@ -745,9 +881,9 @@ export async function runUpdateVerification(scenario) {
         const oldPid = control.expected.pid;
         const quiescent = feed.select("baseline");
         await evaluate(control.main, mainExpression(quitOwnedBase, control.expected));
+        control.main.close(); control = undefined;
         await waitFor(async () => (await findOwnedPids(base.executable)).length === 0,
           { timeoutMs: 30000, code: "signature_base_quit_unverified" });
-        control.main.close(); control = undefined;
         check(await sha256File(path.join(baseApp, "Contents/Resources/app.asar")) === base.asarSha256,
           "base_changed_after_rejection", "failed");
         control = await startBase(base, context.arch, pins.baseVersion, feed.url, (next) => { phase = next; });
@@ -772,7 +908,7 @@ export async function runUpdateVerification(scenario) {
     // Schedule the real preload request in the existing renderer, then close
     // the owned inspector before that request can trigger native quit/relaunch.
     const renderer = await connectCdp(control.rendererPort, oldPid, { targetType: "page", executable: base.executable, timeoutMs: 5000 }).catch(() => undefined);
-    installObserver = { renderer, last: { outcome: "pending", errorClass: "none" } };
+    installObserver = { renderer, last: { outcome: "pending", errorClass: "none" }, shipIt: await captureShipItBaseline(base).catch(() => undefined) };
     installObserver.last = installPromiseObservation(await windowValue(control, replacementProbeExpression("schedule")));
     check(await evaluate(control.main, "(()=>{setTimeout(()=>process.getBuiltinModule('inspector').close(),0);return true})()"),
       "install_diagnostic_close_unverified");
