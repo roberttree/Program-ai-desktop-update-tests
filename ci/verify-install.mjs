@@ -1,12 +1,12 @@
-import { lstat, mkdir, mkdtemp, realpath, rename } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  VerificationFailure, applicationEnvironment, approvedRedirect, assertAbsent, check, connectCdp, connectWebSocket, downloadPinned,
-  emitReceipt, ensureFreshHost, extractZip, findOwnedPids, launchObservation, loadPins, loopbackWebSocket,
-  quarantineRecord, requireCiContext, run, sha256File, terminateOwned, unusedPort, verifyApp, verifyDmg, verifyListener, waitFor,
+  VerificationFailure, applicationEnvironment, approvedRedirect, assertAbsent, check, connectCdp, downloadPinned,
+  emitReceipt, ensureFreshHost, extractZip, findOwnedPids, launchObservation, loadPins,
+  quarantineReadObservation, quarantineRecord, requireCiContext, run, sha256File, terminateOwned, unusedPort, verifyApp, verifyDmg, verifyListener, waitFor,
 } from "./runtime.mjs";
 
 const CHROME = "/Applications/Google Chrome.app";
@@ -31,6 +31,16 @@ export function sameBrowserFile(before, after, quarantineBefore, quarantineAfter
   return before.isFile() && after.isFile() && !before.isSymbolicLink() && !after.isSymbolicLink() &&
     before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.size > 0 &&
     quarantineBefore === quarantineAfter;
+}
+
+export function genuineQuarantineRead(result, startedMs, nowMs = Date.now()) {
+  const observed = quarantineReadObservation(result, startedMs, nowMs);
+  console.log(JSON.stringify({ schemaVersion: 1, check: "browser_quarantine", ...observed }));
+  check(observed.readStatus !== "missing", "browser_quarantine_missing");
+  check(observed.readStatus === "present", "browser_quarantine_read_error");
+  try { quarantineRecord(result.stdout, startedMs, nowMs); }
+  catch { throw new VerificationFailure("unverified", "browser_quarantine_parser_rejected"); }
+  return result.stdout.trim();
 }
 
 async function approveNormalOpen(application) {
@@ -100,6 +110,14 @@ export function chromeLaunchArguments(profile, port) {
     "--no-first-run", "--no-default-browser-check", "about:blank"];
 }
 
+export function normalDownloadPreferences(downloads) {
+  check(typeof downloads === "string" && /^\/Users\/runner\/Downloads\/program-ai-verification-[A-Za-z0-9]{6}$/.test(downloads),
+    "browser_download_directory_invalid");
+  // Use Chrome's ordinary target selection/quarantine pipeline. DevTools
+  // download-behavior overrides replace its normal download manager delegate.
+  return { download: { default_directory: downloads, prompt_for_download: false } };
+}
+
 function startHeadfulChrome(profile, port, observation, observe) {
   // Only the preflight-verified official browser is directly spawned. No
   // headless/security switches or application-launch shortcuts are introduced.
@@ -137,29 +155,30 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
     guiBootstrapExitCode: Number.isInteger(gui.exitCode) && gui.exitCode >= 0 && gui.exitCode <= 255 ? gui.exitCode : null });
   const port = await unusedPort();
   const started = Date.now();
+  const profile = path.join(root, "browser-profile");
+  await assertAbsent(profile);
+  await assertAbsent(path.join(downloads, artifact.name));
+  await mkdir(path.join(profile, "Default"), { recursive: true, mode: 0o700 });
+  await writeFile(path.join(profile, "Default/Preferences"), JSON.stringify(normalDownloadPreferences(downloads)), { flag: "wx", mode: 0o600 });
   const observation = { context: "browser", launcherMode: "direct_vendor_browser", pidCount: 0, listener: "not_checked",
     openStatus: "not_used", openExitCode: null, openTimedOut: false, dialogApproved: false, processStatus: "pending", processExitCode: null };
   observePhase("browser_launch"); observeLaunch(observation);
-  const launcher = startHeadfulChrome(path.join(root, "browser-profile"), port, observation, observeLaunch);
+  const launcher = startHeadfulChrome(profile, port, observation, observeLaunch);
   onLaunch(launcher);
   check(await launcher.started, "headed_browser_spawn_unverified");
   const pid = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome", observation, observeLaunch);
   check(pid === launcher.child.pid, "browser_process_owner_unverified");
   observePhase("browser_connect");
   const page = await connectCdp(port, pid, { executable: CHROME_EXECUTABLE });
-  const version = await fetch(`http://127.0.0.1:${port}/json/version`, { redirect: "error", signal: AbortSignal.timeout(5000) });
-  const metadata = await version.json();
-  const endpoint = loopbackWebSocket(metadata.webSocketDebuggerUrl);
-  check(endpoint.port === String(port), "diagnostic_owner_invalid");
-  const browser = await connectWebSocket(endpoint.href);
   let begun;
   let completed = false;
-  const stopBegin = browser.onEvent("Browser.downloadWillBegin", (event) => { if (validDownloadEvent(event, artifact)) begun = event; });
-  const stopProgress = browser.onEvent("Browser.downloadProgress", (event) => {
+  // Page's normal download events observe actual DownloadItems when Page is
+  // enabled; they do not require replacing Chrome's download delegate.
+  const stopBegin = page.onEvent("Page.downloadWillBegin", (event) => { if (validDownloadEvent(event, artifact)) begun = event; });
+  const stopProgress = page.onEvent("Page.downloadProgress", (event) => {
     if (begun && event.guid === begun.guid && event.state === "completed") completed = true;
   });
   try {
-    await browser.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: downloads, eventsEnabled: true });
     await page.send("Page.enable");
     const url = new URL(artifact.url);
     const release = url.pathname.replace(/\/download\//, "/expanded_assets/").replace(/\/[^/]+$/, "");
@@ -172,22 +191,19 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
     })()`), { timeoutMs: 60000, code: "browser_asset_link_unverified" });
     observePhase("browser_download");
     await waitFor(() => completed && begun, { timeoutMs: 10 * 60 * 1000, code: "browser_download_unverified" });
-    const original = path.join(downloads, begun.guid);
+    const original = path.join(downloads, artifact.name);
     check((await realpath(original)) === original, "browser_download_path_invalid");
     const before = await lstat(original);
     check(before.isFile() && !before.isSymbolicLink() && before.size === artifact.bytes &&
       await sha256File(original) === artifact.sha256, "browser_artifact_mismatch", "failed");
-    const quarantine = (await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", original], { code: "genuine_browser_quarantine_unverified" })).stdout.trim();
-    quarantineRecord(quarantine, started);
-    const named = path.join(downloads, artifact.name);
-    await assertAbsent(named);
-    await rename(original, named);
-    const after = await lstat(named);
-    const renamedQuarantine = (await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", named])).stdout.trim();
-    check(sameBrowserFile(before, after, quarantine, renamedQuarantine), "browser_inode_or_quarantine_changed");
-    return { dmg: named, pid };
+    const attribute = await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", original], { allowFailure: true, maxBytes: 4096 });
+    const quarantine = genuineQuarantineRead(attribute, started);
+    const after = await lstat(original);
+    const unchangedQuarantine = (await run("/usr/bin/xattr", ["-p", "com.apple.quarantine", original])).stdout.trim();
+    check(sameBrowserFile(before, after, quarantine, unchangedQuarantine), "browser_inode_or_quarantine_changed");
+    return { dmg: original, pid };
   } finally {
-    stopBegin(); stopProgress(); browser.close(); page.close();
+    stopBegin(); stopProgress(); page.close();
   }
 }
 
