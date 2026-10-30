@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { accountInputs, budgetObservation, cleanupFailureObservation, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
+import { accountInputs, budgetObservation, cleanupFailureObservation, clickVisibleModelTrigger, dismissVisibleProductTour, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
 
 const runId = "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948";
 const accountId = "12345678-1234-1234-1234-123456789abc";
@@ -106,6 +106,34 @@ test("owned native debugger is detached after final observations but before proc
   assert.ok(cleanup.indexOf("control.main?.close()") < cleanup.indexOf("await terminateOwned(control.expected.executable"));
   assert.ok(source.indexOf("receipt.nativeBudgetActive =") < source.indexOf("const outcomes = await Promise.allSettled("));
   assert.match(cleanup, /findOwnedPids\(control.expected.executable\)\)\.includes\(control.expected.pid\)/);
+});
+
+test("model selection targets the real visible child trigger, not its surrounding wrapper", () => {
+  let clicked = 0, selector;
+  const trigger = { getBoundingClientRect: () => ({ width: 40, height: 30 }), hasAttribute: () => false,
+    getAttribute: () => null, closest: () => null, click: () => clicked++ };
+  const invoke = Function("document", `return (${clickVisibleModelTrigger.toString()})()`);
+  assert.equal(invoke({ querySelectorAll(value) { selector = value; return [trigger]; } }), true);
+  assert.equal(selector, '[data-component="prompt-model-control"] [data-action="prompt-model"]');
+  assert.equal(clicked, 1);
+  assert.equal(invoke({ querySelectorAll: () => [trigger, trigger] }), false);
+  assert.equal(invoke({ querySelectorAll: () => [{ ...trigger, closest: () => ({}) }] }), false);
+  assert.equal(clicked, 1);
+});
+
+test("fresh-account tour is dismissed only through its unique normal visible Skip tour button", () => {
+  let clicked = 0;
+  const button = { disabled: false, getBoundingClientRect: () => ({ width: 40, height: 30 }),
+    getAttribute: () => null, closest: () => null, click: () => clicked++ };
+  const tour = { getBoundingClientRect: button.getBoundingClientRect, querySelectorAll: (selector) => selector === '[data-testid="tour-skip"]' ? [button] : [] };
+  const invoke = Function("document", `return (${dismissVisibleProductTour.toString()})()`);
+  assert.equal(invoke({ querySelectorAll: () => [] }), "not_present");
+  assert.equal(invoke({ querySelectorAll: () => [tour] }), "clicked");
+  assert.equal(clicked, 1);
+  assert.equal(invoke({ querySelectorAll: () => [tour, tour] }), "unverified");
+  assert.equal(invoke({ querySelectorAll: () => [{ ...tour, querySelectorAll: () => [{ ...button, disabled: true }] }] }), "unverified");
+  assert.equal(clicked, 1);
+  assert.doesNotMatch(dismissVisibleProductTour.toString(), /store|localStorage|setSession|onDismiss/);
 });
 
 test("live prototype proves exact public native CI and trust before spawning, installs budget before startup, and has no auth shortcut", async () => {
