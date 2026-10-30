@@ -13,7 +13,7 @@ const PINS_SHA256 = "dcb5b68677bf51abfdcbb5c4b676d6941cacb6d71d5e13bc473190f8a81
 const SOURCE_COMMIT = "35cd78e4f55e6fc5b15a8373e33dcf3958323415";
 const GUARD_FILE = fileURLToPath(new URL("./native-budget.mjs", import.meta.url));
 const GUARD_SHA256 = "830342bfb637170645430f2a853efe3e985040738a9c70bb14d2a525146e7d18";
-const ACCOUNT_RUN = "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948";
+const ACCOUNT_RUN = "0ce7077a-fd9b-4f71-ab89-87029e523615";
 const CHROME = "/Applications/Google Chrome.app";
 const CHROME_EXECUTABLE = `${CHROME}/Contents/MacOS/Google Chrome`;
 const MARK = "program-ai-native-account-queue-verification";
@@ -34,7 +34,7 @@ export function validCallbackUrl(value) {
 }
 
 export function accountInputs(env, arch, now = Date.now()) {
-  check(["arm64", "x64"].includes(arch), "temporary_test_credentials_unavailable");
+  check(arch === "x64", "temporary_test_credentials_unavailable");
   const prefix = `PROGRAM_AI_NATIVE_1_0_10_${arch.toUpperCase()}`;
   const email = env[`${prefix}_EMAIL`], password = env[`${prefix}_PASSWORD`];
   const encoded = env[`${prefix}_LEASE`]; let lease;
@@ -78,13 +78,27 @@ export function dismissVisibleProductTour() {
   return "clicked";
 }
 
-export function clickVisibleModelTrigger() {
-  const nodes = Array.from(document.querySelectorAll('[data-action="prompt-model"]'))
-    .filter((node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0 &&
-      !node.hasAttribute("disabled") && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]"));
+export function modelPointerTarget(kind) {
+  const selectors = {
+    trigger: '[data-action="prompt-model"]',
+    option: '[data-option-key="openrouter:openai/gpt-4.1-mini"],[data-key="openrouter:openai/gpt-4.1-mini"],[role="dialog"] button[data-provider-id="openrouter"][data-model-id="openai/gpt-4.1-mini"]',
+  };
+  if (!Object.hasOwn(selectors, kind) || document.visibilityState !== "visible") return false;
+  const nodes = Array.from(document.querySelectorAll(selectors[kind])).filter((node) => {
+    const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && !node.disabled && !node.hasAttribute("disabled") &&
+      !node.hasAttribute("data-disabled") && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]") &&
+      style.display !== "none" && !["hidden", "collapse"].includes(style.visibility) && style.pointerEvents !== "none" && Number(style.opacity) > 0;
+  });
   if (nodes.length !== 1) return false;
-  nodes[0].click();
-  return true;
+  const node = nodes[0], rect = node.getBoundingClientRect();
+  const x = Math.floor(rect.left + rect.width / 2), y = Math.floor(rect.top + rect.height / 2);
+  const width = window.innerWidth, height = window.innerHeight;
+  if (![rect.left, rect.top, rect.width, rect.height, x, y, width, height].every(Number.isFinite) ||
+    !Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || width > 16384 || height > 16384 ||
+    x < 0 || y < 0 || x >= width || y >= height || x < rect.left || y < rect.top || x >= rect.right || y >= rect.bottom) return false;
+  const hit = document.elementFromPoint(x, y);
+  return hit && (hit === node || node.contains(hit)) ? { x, y, width, height } : false;
 }
 
 export function workspaceObservation() {
@@ -184,7 +198,7 @@ function nativeBootstrap(expected, guardFactory, signInValidator) {
   return globalThis.fetch === budget.fetch;
 }
 
-async function inNativeWindow(expected, expression) {
+export async function inNativeWindow(expected, expression, nativePointer = false) {
   const require = process.getBuiltinModule("module").createRequire(process.resourcesPath + "/app.asar/package.json");
   const electron = require("electron");
   if (process.pid !== expected.pid || process.execPath !== expected.executable || process.arch !== expected.arch ||
@@ -192,7 +206,28 @@ async function inNativeWindow(expected, expression) {
   const windows = electron.BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed() && window.isVisible() &&
     !window.webContents.isDestroyed() && window.webContents.getURL().startsWith("program-ai://renderer/"));
   if (windows.length !== 1) throw new Error("owned_renderer_required");
-  return windows[0].webContents.executeJavaScript(expression, true);
+  const window = windows[0], contents = window.webContents;
+  if (!nativePointer) return contents.executeJavaScript(expression, true);
+  // Electron requires the containing native window to be focused. Focus can
+  // settle asynchronously; never send input to an unfocused or replaced page.
+  window.focus(); contents.focus();
+  for (let attempt = 0; attempt < 40 && (!window.isFocused() || !contents.isFocused()); attempt++)
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  if (window.isDestroyed() || contents.isDestroyed() || !window.isVisible() || !window.isFocused() || !contents.isFocused() ||
+    !contents.getURL().startsWith("program-ai://renderer/") || contents.getZoomFactor() !== 1) return false;
+  const point = await contents.executeJavaScript(expression, true);
+  if (!point || ![point.x, point.y, point.width, point.height].every(Number.isSafeInteger) ||
+    point.width < 1 || point.height < 1 || point.width > 16384 || point.height > 16384 ||
+    point.x < 0 || point.y < 0 || point.x >= point.width || point.y >= point.height || !window.isFocused() || !contents.isFocused()) return false;
+  contents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+  try {
+    contents.sendInputEvent({ type: "mouseDown", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  } finally {
+    // The down event may open the menu. Always release at the same point;
+    // do not return early or resolve a different target between down and up.
+    contents.sendInputEvent({ type: "mouseUp", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  }
+  return true;
 }
 
 async function startCandidate(app, arch, onSpawn, budgetExpiresAtMs) {
@@ -215,7 +250,8 @@ async function startCandidate(app, arch, onSpawn, budgetExpiresAtMs) {
   check(!guard.exceptionDetails && guard.result?.value === true, "native_budget_bootstrap_unverified");
   stop(); await main.send("Debugger.resume"); await main.send("Debugger.disable");
   return { child, main, expected, window: (expression, timeout = 30000) => evaluate(main,
-    `(${inNativeWindow.toString()})(${JSON.stringify(expected)},${JSON.stringify(expression)})`, timeout) };
+    `(${inNativeWindow.toString()})(${JSON.stringify(expected)},${JSON.stringify(expression)})`, timeout),
+  modelPointer: (kind) => evaluate(main, `(${inNativeWindow.toString()})(${JSON.stringify(expected)},${JSON.stringify(`(${modelPointerTarget.toString()})(${JSON.stringify(kind)})`)},true)`) };
 }
 
 async function startAuthBrowser(root, onSpawn) {
@@ -253,10 +289,10 @@ async function sidecarRequest(connection, route, project, body) {
 }
 
 async function selectMini(control) {
-  check(await control.window(`(${clickVisibleModelTrigger.toString()})()`), "native_model_control_unavailable");
+  await waitFor(() => control.modelPointer("trigger"), { timeoutMs: 10000, code: "native_model_control_unavailable" });
   await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-composer-menu="true"] input, [role="dialog"] [data-slot="list-search-input"], [role="dialog"] input[type="search"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;const input=nodes[0];Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'openai/gpt-4.1-mini');input.dispatchEvent(new Event('input',{bubbles:true}));return true})()`), { timeoutMs: 30000, code: "native_model_search_unavailable" });
-  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-option-key="openrouter:openai/gpt-4.1-mini"],[data-key="openrouter:openai/gpt-4.1-mini"],[role="dialog"] button[data-provider-id="openrouter"][data-model-id="openai/gpt-4.1-mini"]')).filter(x=>x.getBoundingClientRect().height>0&&!x.hasAttribute('data-disabled')&&!x.disabled&&x.getAttribute('aria-disabled')!=='true');if(nodes.length!==1)return false;nodes[0].click();return true})()`), { timeoutMs: 30000, code: "native_exact_model_unavailable" });
-  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-action="prompt-model"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;const n=nodes[0];return n.hasAttribute('data-model-id')?n.getAttribute('data-provider-id')==='openrouter'&&n.getAttribute('data-model-id')==='openai/gpt-4.1-mini':n.textContent.includes('GPT-4.1 Mini')})()`), { timeoutMs: 10000, code: "native_selected_model_unverified" });
+  await waitFor(() => control.modelPointer("option"), { timeoutMs: 30000, code: "native_exact_model_unavailable" });
+  await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-action="prompt-model"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;const n=nodes[0];return n.getAttribute('data-provider-id')==='openrouter'&&n.getAttribute('data-model-id')==='openai/gpt-4.1-mini'})()`), { timeoutMs: 10000, code: "native_selected_model_unverified" });
 }
 
 async function dismissProductTour(control) {
@@ -299,6 +335,7 @@ export async function runNativeAccountQueue() {
     check(await sha256File(GUARD_FILE) === GUARD_SHA256, "native_budget_source_hash_mismatch");
     const pins = await loadPins(PINS_FILE); check(pins.source.commit === SOURCE_COMMIT, "candidate_source_mismatch");
     const context = await requireCiContext(pins); guarded = true; receipt.arch = context.arch; receipt.version = pins.version; receipt.sourceCommit = SOURCE_COMMIT; receipt.candidatePinsSha256 = PINS_SHA256;
+    check(context.arch === "x64", "native_replacement_architecture_not_approved");
     await ensureFreshHost(pins);
     const account = accountInputs(process.env, context.arch); // Never passed to either child environment.
     const runnerTemp = await realpath(process.env.RUNNER_TEMP ?? "");
