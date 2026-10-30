@@ -61,6 +61,11 @@ export function budgetObservation(value) {
   return output;
 }
 
+export function cleanupFailureObservation(receipt) {
+  return { status: receipt.status === "passed" ? "unverified" : receipt.status,
+    code: receipt.code ?? "owned_cleanup_unverified", cleanupCode: "owned_cleanup_unverified" };
+}
+
 export function syntheticQueuePrompts(project, marker) {
   check(/^\/Users\/runner\/[^\r\n'`$]*\/native-account-queue-[A-Za-z0-9]{6}\/project$/.test(project) &&
     path.normalize(project) === project && /^PAI_QUEUE_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(marker), "synthetic_project_scope_invalid");
@@ -308,14 +313,17 @@ export async function runNativeAccountQueue() {
       const outcomes = await Promise.allSettled([
         (async () => { if (!control) return;
           if (control.window) receipt.accountSignOut = await control.window("window.api.programAICloudAuth.signOut().then(()=>window.api.programAICloudAuth.getState()).then(s=>s.status==='signed_out')").then((value) => value === true ? "confirmed" : "unverified", () => "unverified");
-          try { if ((await findOwnedPids(control.expected.executable)).includes(control.expected.pid)) await terminateOwned(control.expected.executable, control.expected.pid); }
-          finally { control.main?.close(); }
+          // A live Node inspector can keep an otherwise-terminated process
+          // waiting for debugger disconnect. Finish observations, then detach
+          // before terminating only our already-attested native process.
+          control.main?.close();
+          if ((await findOwnedPids(control.expected.executable)).includes(control.expected.pid)) await terminateOwned(control.expected.executable, control.expected.pid);
         })(),
         (async () => { if (!browser) return; browser.page?.close();
           if ((await findOwnedPids(CHROME_EXECUTABLE)).includes(browser.child.pid)) await terminateOwned(CHROME_EXECUTABLE, browser.child.pid);
         })(),
       ]);
-      if (outcomes.some((outcome) => outcome.status === "rejected")) { receipt.status = "unverified"; receipt.code = "owned_cleanup_unverified"; }
+      if (outcomes.some((outcome) => outcome.status === "rejected")) Object.assign(receipt, cleanupFailureObservation(receipt));
     }
     console.log(JSON.stringify(receipt)); // No raw exceptions, credentials, callback URLs, paths, PIDs or app output.
   }

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { accountInputs, budgetObservation, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
+import { accountInputs, budgetObservation, cleanupFailureObservation, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
 
 const runId = "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948";
 const accountId = "12345678-1234-1234-1234-123456789abc";
@@ -89,6 +89,23 @@ test("native budget receipt is a fixed projection and cannot carry body, key, UR
   assert.doesNotMatch(JSON.stringify(value), /private|token|\/|body"/);
   const invalid = budgetObservation({ attempted: 5, maximumOutputTokens: 513, requestMutations: true });
   assert.equal(invalid.attempted, null); assert.equal(invalid.maximumOutputTokens, null); assert.equal(invalid.requestMutations, "unverified");
+});
+
+test("cleanup diagnostics preserve a preceding setup failure and cannot leave a cleanup failure passed", () => {
+  assert.deepEqual(cleanupFailureObservation({ status: "unverified", code: "browser_signature_unverified" }),
+    { status: "unverified", code: "browser_signature_unverified", cleanupCode: "owned_cleanup_unverified" });
+  assert.deepEqual(cleanupFailureObservation({ status: "failed", code: "native_queued_file_bytes_mismatch" }),
+    { status: "failed", code: "native_queued_file_bytes_mismatch", cleanupCode: "owned_cleanup_unverified" });
+  assert.deepEqual(cleanupFailureObservation({ status: "passed" }),
+    { status: "unverified", code: "owned_cleanup_unverified", cleanupCode: "owned_cleanup_unverified" });
+});
+
+test("owned native debugger is detached after final observations but before process termination", async () => {
+  const source = await readFile(new URL("./native-account-queue.mjs", import.meta.url), "utf8");
+  const cleanup = source.slice(source.indexOf("const outcomes = await Promise.allSettled("));
+  assert.ok(cleanup.indexOf("control.main?.close()") < cleanup.indexOf("await terminateOwned(control.expected.executable"));
+  assert.ok(source.indexOf("receipt.nativeBudgetActive =") < source.indexOf("const outcomes = await Promise.allSettled("));
+  assert.match(cleanup, /findOwnedPids\(control.expected.executable\)\)\.includes\(control.expected.pid\)/);
 });
 
 test("live prototype proves exact public native CI and trust before spawning, installs budget before startup, and has no auth shortcut", async () => {
