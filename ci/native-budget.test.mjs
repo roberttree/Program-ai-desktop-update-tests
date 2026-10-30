@@ -62,7 +62,9 @@ test("guard enforces byte buffers and both max-token field variants, without ser
   assert.throws(() => guard.fetch(URL, different)); assert.equal(calls, 1);
 });
 test("unbounded or expired guard windows cannot be installed", () => {
-  for (const expiresAtMs of [Date.now() - 1, Date.now() + 2700001, NaN, "future"]) {
+  // A one-millisecond over-limit fixture can become valid while the test is
+  // scheduled. Keep a generous margin; the guard's actual limit is unchanged.
+  for (const expiresAtMs of [Date.now() - 1, Date.now() + 5400000, NaN, "future"]) {
     assert.throws(() => makeNativeBudgetGuard(() => {}, { expiresAtMs }), /configuration_rejected/);
   }
 });
