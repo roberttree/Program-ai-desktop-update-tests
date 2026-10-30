@@ -61,6 +61,11 @@ export function budgetObservation(value) {
   return output;
 }
 
+export function cleanupFailureObservation(receipt) {
+  return { status: receipt.status === "passed" ? "unverified" : receipt.status,
+    code: receipt.code ?? "owned_cleanup_unverified", cleanupCode: "owned_cleanup_unverified" };
+}
+
 export function syntheticQueuePrompts(project, marker) {
   check(/^\/Users\/runner\/[^\r\n'`$]*\/native-account-queue-[A-Za-z0-9]{6}\/project$/.test(project) &&
     path.normalize(project) === project && /^PAI_QUEUE_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(marker), "synthetic_project_scope_invalid");
@@ -252,13 +257,13 @@ export async function runNativeAccountQueue() {
     await waitFor(() => control.window("!!window.api?.programAICloudAuth?.signIn&&!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "native_preload_unavailable" });
     receipt.phase = "browser_preflight"; browser = await startAuthBrowser(root, (owned) => { browser = owned; });
     receipt.phase = "normal_account_sign_in"; await normalWebSignIn(control, browser, account); receipt.accountConnected = true;
-    const connection = await sidecarConnection(control);
-    const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
+    receipt.phase = "sidecar_ready"; const connection = await sidecarConnection(control);
+    receipt.phase = "session_create"; const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
     check(typeof session.id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(session.id), "native_session_unverified");
     const route = `program-ai://renderer/${Buffer.from(project).toString("base64url")}/session/${session.id}`;
-    await control.window(`location.href=${JSON.stringify(route)};true`);
+    receipt.phase = "workspace_open"; await control.window(`location.href=${JSON.stringify(route)};true`);
     await waitFor(() => control.window("document.querySelector('[data-component=prompt-model-control]')?.getBoundingClientRect().height>0"), { timeoutMs: 90000, code: "native_composer_unavailable" });
-    await selectMini(control);
+    receipt.phase = "model_select"; await selectMini(control);
     check(Date.now() < account.useUntilMs, "temporary_test_credentials_expired");
     check(await evaluate(control.main, `(()=>{const s=globalThis[Symbol.for(${JSON.stringify(MARK)})];return !!s&&globalThis.fetch===s.budget.fetch&&s.budget.read().attempted===0&&s.budget.read().rejected===0})()`), "native_budget_not_active");
     const marker = `PAI_QUEUE_${randomUUID()}`, prompts = syntheticQueuePrompts(project, marker), filename = path.join(project, "queue-result.txt");
@@ -308,14 +313,17 @@ export async function runNativeAccountQueue() {
       const outcomes = await Promise.allSettled([
         (async () => { if (!control) return;
           if (control.window) receipt.accountSignOut = await control.window("window.api.programAICloudAuth.signOut().then(()=>window.api.programAICloudAuth.getState()).then(s=>s.status==='signed_out')").then((value) => value === true ? "confirmed" : "unverified", () => "unverified");
-          try { if ((await findOwnedPids(control.expected.executable)).includes(control.expected.pid)) await terminateOwned(control.expected.executable, control.expected.pid); }
-          finally { control.main?.close(); }
+          // A live Node inspector can keep an otherwise-terminated process
+          // waiting for debugger disconnect. Finish observations, then detach
+          // before terminating only our already-attested native process.
+          control.main?.close();
+          if ((await findOwnedPids(control.expected.executable)).includes(control.expected.pid)) await terminateOwned(control.expected.executable, control.expected.pid);
         })(),
         (async () => { if (!browser) return; browser.page?.close();
           if ((await findOwnedPids(CHROME_EXECUTABLE)).includes(browser.child.pid)) await terminateOwned(CHROME_EXECUTABLE, browser.child.pid);
         })(),
       ]);
-      if (outcomes.some((outcome) => outcome.status === "rejected")) { receipt.status = "unverified"; receipt.code = "owned_cleanup_unverified"; }
+      if (outcomes.some((outcome) => outcome.status === "rejected")) Object.assign(receipt, cleanupFailureObservation(receipt));
     }
     console.log(JSON.stringify(receipt)); // No raw exceptions, credentials, callback URLs, paths, PIDs or app output.
   }
