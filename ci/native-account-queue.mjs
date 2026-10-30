@@ -66,6 +66,27 @@ export function cleanupFailureObservation(receipt) {
     code: receipt.code ?? "owned_cleanup_unverified", cleanupCode: "owned_cleanup_unverified" };
 }
 
+export function dismissVisibleProductTour() {
+  const visible = (node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0;
+  const tours = Array.from(document.querySelectorAll('[data-component="product-tour"]')).filter(visible);
+  if (tours.length === 0) return "not_present";
+  if (tours.length !== 1) return "unverified";
+  const buttons = Array.from(tours[0].querySelectorAll('[data-testid="tour-skip"]'))
+    .filter((node) => visible(node) && !node.disabled && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]"));
+  if (buttons.length !== 1) return "unverified";
+  buttons[0].click();
+  return "clicked";
+}
+
+export function clickVisibleModelTrigger() {
+  const nodes = Array.from(document.querySelectorAll('[data-component="prompt-model-control"] [data-action="prompt-model"]'))
+    .filter((node) => node.getBoundingClientRect().width > 0 && node.getBoundingClientRect().height > 0 &&
+      !node.hasAttribute("disabled") && node.getAttribute("aria-disabled") !== "true" && !node.closest("[inert]"));
+  if (nodes.length !== 1) return false;
+  nodes[0].click();
+  return true;
+}
+
 export function syntheticQueuePrompts(project, marker) {
   check(/^\/Users\/runner\/[^\r\n'`$]*\/native-account-queue-[A-Za-z0-9]{6}\/project$/.test(project) &&
     path.normalize(project) === project && /^PAI_QUEUE_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(marker), "synthetic_project_scope_invalid");
@@ -204,9 +225,17 @@ async function sidecarRequest(connection, route, project, body) {
 }
 
 async function selectMini(control) {
-  check(await control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-component="prompt-model-control"]')).filter(x=>x.getBoundingClientRect().height>0);if(nodes.length!==1)return false;nodes[0].click();return true})()`), "native_model_control_unavailable");
+  check(await control.window(`(${clickVisibleModelTrigger.toString()})()`), "native_model_control_unavailable");
   await waitFor(() => control.window(`(()=>{const input=document.querySelector('[data-composer-menu="true"] input, [role="dialog"] [data-slot="list-search-input"]');if(!input)return false;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'openai/gpt-4.1-mini');input.dispatchEvent(new Event('input',{bubbles:true}));return true})()`), { timeoutMs: 30000, code: "native_model_search_unavailable" });
   await waitFor(() => control.window(`(()=>{const nodes=Array.from(document.querySelectorAll('[data-option-key="openrouter:openai/gpt-4.1-mini"],[data-key="openrouter:openai/gpt-4.1-mini"]')).filter(x=>x.getBoundingClientRect().height>0&&!x.hasAttribute('data-disabled'));if(nodes.length!==1)return false;nodes[0].click();return true})()`), { timeoutMs: 30000, code: "native_exact_model_unavailable" });
+}
+
+async function dismissProductTour(control) {
+  const outcome = await control.window(`(${dismissVisibleProductTour.toString()})()`);
+  check(["clicked", "not_present"].includes(outcome), "native_product_tour_control_unverified");
+  if (outcome === "clicked") await waitFor(() => control.window("!Array.from(document.querySelectorAll('[data-component=product-tour]')).some(n=>n.getBoundingClientRect().width>0&&n.getBoundingClientRect().height>0)"),
+    { timeoutMs: 10000, code: "native_product_tour_dismissal_unverified" });
+  return outcome === "clicked";
 }
 
 async function normalWebSignIn(control, browser, account) {
@@ -257,12 +286,14 @@ export async function runNativeAccountQueue() {
     await waitFor(() => control.window("!!window.api?.programAICloudAuth?.signIn&&!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "native_preload_unavailable" });
     receipt.phase = "browser_preflight"; browser = await startAuthBrowser(root, (owned) => { browser = owned; });
     receipt.phase = "normal_account_sign_in"; await normalWebSignIn(control, browser, account); receipt.accountConnected = true;
+    receipt.phase = "product_tour"; receipt.tourDismissed = await dismissProductTour(control);
     receipt.phase = "sidecar_ready"; const connection = await sidecarConnection(control);
     receipt.phase = "session_create"; const session = await sidecarRequest(connection, "/session", project, { title: "Native account queue verification" });
     check(typeof session.id === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(session.id), "native_session_unverified");
     const route = `program-ai://renderer/${Buffer.from(project).toString("base64url")}/session/${session.id}`;
     receipt.phase = "workspace_open"; await control.window(`location.href=${JSON.stringify(route)};true`);
     await waitFor(() => control.window("document.querySelector('[data-component=prompt-model-control]')?.getBoundingClientRect().height>0"), { timeoutMs: 90000, code: "native_composer_unavailable" });
+    receipt.phase = "workspace_tour"; receipt.tourDismissed = await dismissProductTour(control) || receipt.tourDismissed;
     receipt.phase = "model_select"; await selectMini(control);
     check(Date.now() < account.useUntilMs, "temporary_test_credentials_expired");
     check(await evaluate(control.main, `(()=>{const s=globalThis[Symbol.for(${JSON.stringify(MARK)})];return !!s&&globalThis.fetch===s.budget.fetch&&s.budget.read().attempted===0&&s.budget.read().rejected===0})()`), "native_budget_not_active");
