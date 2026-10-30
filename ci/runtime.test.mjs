@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   PUBLIC_REPOSITORY, VerificationFailure, approvedRedirect, launchObservation, loopbackWebSocket, parseUpdaterConfiguration,
-  quarantineRecord, receipt, signatureIdentity, staplerAction, staplerObservation, validateArtifact, validateCiFacts, validateMachOInventory, validatePins, validateZipArchive,
+  quarantineReadObservation, quarantineRecord, receipt, signatureIdentity, staplerAction, staplerObservation, validateArtifact, validateCiFacts, validateMachOInventory, validatePins, validateZipArchive,
 } from "./runtime.mjs";
 
 const hash = "a".repeat(64);
@@ -233,6 +233,25 @@ test("quarantine requires recent nonzero Chrome-origin metadata, never a simulat
     record.replace("12345678-1234-1234-1234-123456789abc", "-".repeat(36))])
     failure(() => quarantineRecord(invalid, now - 1000, now), "genuine_browser_quarantine_unverified");
   failure(() => quarantineRecord(record, now + 120000, now + 120000), "genuine_browser_quarantine_unverified");
+});
+
+test("quarantine diagnostics separate missing/read errors from bounded parser facts without exposing attribute data", () => {
+  const now = 1800000000000;
+  const value = `0083;${Math.floor(now / 1000).toString(16)};Google Chrome;12345678-1234-1234-1234-123456789abc`;
+  const observed = quarantineReadObservation({ exitCode: 0, stdout: value }, now, now);
+  assert.deepEqual(observed, { readStatus: "present", present: true, fieldCount: 4, flagLength: 4,
+    flagsValid: true, timestampValid: true, timestampInRange: true, knownAgent: true, uuidValid: true });
+  assert.doesNotMatch(JSON.stringify(observed), /12345678|Google Chrome|0083/);
+  assert.equal(quarantineReadObservation({ exitCode: 1, stderr: "/private/path: No such xattr: com.apple.quarantine" }, now, now).readStatus, "missing");
+  assert.equal(quarantineReadObservation({ exitCode: 1, stderr: "/private/path: No such file or directory" }, now, now).readStatus, "read_error");
+  assert.equal(quarantineReadObservation({ exitCode: null, timedOut: true }, now, now).readStatus, "read_error");
+  assert.equal(quarantineReadObservation({ exitCode: 0, stdout: value.replace("0083", "0000") }, now, now).flagsValid, false);
+  assert.equal(quarantineReadObservation({ exitCode: 0, stdout: value.replace("Google Chrome", "Other application") }, now, now).knownAgent, false);
+  assert.equal(quarantineReadObservation({ exitCode: 0, stdout: value }, now + 120000, now + 120000).timestampInRange, false);
+  assert.equal(quarantineReadObservation({ exitCode: 0, stdout: value.replace("12345678", "invalid") }, now, now).uuidValid, false);
+  const malformed = quarantineReadObservation({ exitCode: 0, stdout: "x".repeat(100) + ";".repeat(100) }, now, now);
+  assert.equal(malformed.fieldCount, 5); // 5 means at least 5, never the raw number.
+  assert.equal(malformed.flagLength, 9); // 9 means at least 9, never raw content.
 });
 
 test("public receipts omit raw logs, paths, secrets and source data and do not assert a build", () => {

@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { chromeLaunchArguments, firstLaunchObservation, launchFailureCode, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+import { chromeLaunchArguments, firstLaunchObservation, launchFailureCode, normalDownloadPreferences, normalOpenDialog, sameBrowserFile, validDownloadEvent } from "./verify-install.mjs";
+
+test("normal download preferences target only the fresh CI-owned Downloads directory without security preferences", () => {
+  const directory = "/Users/runner/Downloads/program-ai-verification-a1B2c3";
+  assert.deepEqual(normalDownloadPreferences(directory), { download: { default_directory: directory, prompt_for_download: false } });
+  for (const invalid of ["/Users/owner/Downloads/program-ai-verification-a1B2c3", directory + "/..", "/private/tmp/download", "/Users/runner/Downloads"])
+    assert.throws(() => normalDownloadPreferences(invalid), { code: "browser_download_directory_invalid" });
+});
 
 test("verified vendor browser arguments remain headful, loopback-only and contain no security bypass flags", () => {
   assert.deepEqual(chromeLaunchArguments("/Users/runner/work/_temp/owned/browser-profile", 1234), [
@@ -88,6 +95,13 @@ test("the actual driver guards first, proves ZIP app trust before Chrome, and ne
   assert.ok(browser.indexOf('"--verify", "--deep", "--strict", CHROME') < browser.indexOf("startHeadfulChrome("));
   assert.ok(browser.indexOf('"--assess", "--type", "execute", CHROME') < browser.indexOf("startHeadfulChrome("));
   assert.doesNotMatch(browser, /run\("\/usr\/bin\/open"/);
+  assert.doesNotMatch(source, /(?:Browser|Page)\.setDownloadBehavior|allowAndName/);
+  assert.match(browser, /page\.onEvent\("Page\.downloadWillBegin"/);
+  assert.match(browser, /page\.onEvent\("Page\.downloadProgress"/);
+  assert.match(browser, /event\.state === "completed"/);
+  assert.ok(browser.indexOf("normalDownloadPreferences(downloads)") < browser.indexOf("startHeadfulChrome("));
+  assert.ok(browser.indexOf("completed && begun") < browser.indexOf("await sha256File(original)"));
+  assert.match(browser, /genuineQuarantineRead\(attribute, started\)/);
   assert.doesNotMatch(source, /xattr[^\n]*(?:-d|-c|-w)|spctl[^\n]*(?:--master-disable|--disable)|tccutil|fuses\.write|\.updater\.install|chat\/completions/);
   assert.doesNotMatch(flow, /press\(.?Enter|key.?\s*:\s*.Enter/);
 });

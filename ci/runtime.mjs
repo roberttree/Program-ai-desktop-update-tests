@@ -656,13 +656,26 @@ export async function evaluate(client, expression, timeoutMs = 30000) {
   return result.result?.value;
 }
 
+export function quarantineReadObservation(result, startedMs, nowMs = Date.now()) {
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const diagnostic = `${typeof result.stderr === "string" ? result.stderr : ""}\n${stdout}`.slice(0, 8192);
+  const readStatus = result.exitCode === 0 && stdout.length <= 4096 ? "present" :
+    /No such xattr:\s*com\.apple\.quarantine\b|No such extended attribute/i.test(diagnostic) ? "missing" : "read_error";
+  const parts = readStatus === "present" ? stdout.trim().split(";") : [];
+  const flags = parts[0] ?? "", timestamp = parts[1] ?? "";
+  const created = Number.parseInt(timestamp, 16) * 1000;
+  const timestampValid = /^[a-f0-9]{8,16}$/i.test(timestamp) && Number.isSafeInteger(created);
+  return { readStatus, present: readStatus === "present", fieldCount: Math.min(parts.length, 5), flagLength: Math.min(flags.length, 9),
+    flagsValid: /^[a-f0-9]{4,8}$/i.test(flags) && Number.parseInt(flags, 16) !== 0,
+    timestampValid, timestampInRange: timestampValid && created >= startedMs - 60000 && created <= nowMs + 60000,
+    knownAgent: ["Google Chrome", "Chrome"].includes(parts[2]),
+    uuidValid: /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(parts[3] ?? "") };
+}
+
 export function quarantineRecord(text, startedMs, nowMs = Date.now()) {
-  const parts = text.trim().split(";");
-  const created = Number.parseInt(parts[1] ?? "", 16) * 1000;
-  check(parts.length === 4 && /^[a-f0-9]{4,8}$/i.test(parts[0]) && Number.parseInt(parts[0], 16) !== 0 &&
-    /^[a-f0-9]{8,16}$/i.test(parts[1]) && ["Google Chrome", "Chrome"].includes(parts[2]) &&
-    /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(parts[3]) && created >= startedMs - 60000 && created <= nowMs + 60000,
-    "genuine_browser_quarantine_unverified");
+  const observed = quarantineReadObservation({ exitCode: 0, stdout: text }, startedMs, nowMs);
+  check(observed.present && observed.fieldCount === 4 && observed.flagsValid && observed.timestampValid &&
+    observed.timestampInRange && observed.knownAgent && observed.uuidValid, "genuine_browser_quarantine_unverified");
   return true;
 }
 
