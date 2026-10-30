@@ -114,7 +114,7 @@ test("model selection targets the real visible child trigger, not its surroundin
     getAttribute: () => null, closest: () => null, click: () => clicked++ };
   const invoke = Function("document", `return (${clickVisibleModelTrigger.toString()})()`);
   assert.equal(invoke({ querySelectorAll(value) { selector = value; return [trigger]; } }), true);
-  assert.equal(selector, '[data-component="prompt-model-control"] [data-action="prompt-model"]');
+  assert.equal(selector, '[data-action="prompt-model"]');
   assert.equal(clicked, 1);
   assert.equal(invoke({ querySelectorAll: () => [trigger, trigger] }), false);
   assert.equal(invoke({ querySelectorAll: () => [{ ...trigger, closest: () => ({}) }] }), false);
