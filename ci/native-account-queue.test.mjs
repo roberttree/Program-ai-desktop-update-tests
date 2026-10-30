@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { accountInputs, budgetObservation, cleanupFailureObservation, clickVisibleModelTrigger, dismissVisibleProductTour, openVisibleSyntheticSession, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
+import { accountInputs, budgetObservation, cleanupFailureObservation, dismissVisibleProductTour, inNativeWindow, modelPointerTarget, openVisibleSyntheticSession, queueMessageObservation, syntheticQueuePrompts, validCallbackUrl, validSignInUrl } from "./native-account-queue.mjs";
 
-const runId = "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948";
+const runId = "0ce7077a-fd9b-4f71-ab89-87029e523615";
 const accountId = "12345678-1234-1234-1234-123456789abc";
 const project = "/Users/runner/work/_temp/native-account-queue-a1B2c3/project";
 const marker = `PAI_QUEUE_${accountId}`;
@@ -28,7 +28,7 @@ test("normal callback admits only the exact rendered ticket/state scheme and nev
     assert.equal(validCallbackUrl(invalid), false);
 });
 
-function fakeCredentials(now = 1800000000000, arch = "arm64") {
+function fakeCredentials(now = 1800000000000, arch = "x64") {
   const prefix = `PROGRAM_AI_NATIVE_1_0_10_${arch.toUpperCase()}`;
   const lease = { arch, runId, accountId, createdAtMs: now - 1000, fundingCredits: 40,
     useUntilMs: now + 60000, settings: { creditValueUsd: 0.03266667, providerCostMultiplier: 3.33333333, minimumGenerationCredits: 10 } };
@@ -37,17 +37,18 @@ function fakeCredentials(now = 1800000000000, arch = "arm64") {
 
 test("credential reads require the exact newly provisioned architecture/run, ordinary identity and unexpired lease", () => {
   const now = 1800000000000;
-  for (const arch of ["arm64", "x64"]) assert.equal(accountInputs(fakeCredentials(now, arch), arch, now).accountId, accountId);
+  assert.equal(accountInputs(fakeCredentials(now), "x64", now).accountId, accountId);
+  assert.throws(() => accountInputs(fakeCredentials(now, "arm64"), "arm64", now), { code: "temporary_test_credentials_unavailable" });
   for (const changes of [
-    { PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL: "owner@example.invalid" },
-    { PROGRAM_AI_NATIVE_1_0_10_ARM64_PASSWORD: "not-a-random-256-bit-password" },
-    { PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE: "not JSON" },
-  ]) assert.throws(() => accountInputs({ ...fakeCredentials(now), ...changes }, "arm64", now), { code: "temporary_test_credentials_unavailable" });
-  for (const changes of [{ runId: accountId }, { arch: "x64" }, { useUntilMs: now - 1 }, { createdAtMs: now - 2700001 },
+    { PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL: "owner@example.invalid" },
+    { PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD: "not-a-random-256-bit-password" },
+    { PROGRAM_AI_NATIVE_1_0_10_X64_LEASE: "not JSON" },
+  ]) assert.throws(() => accountInputs({ ...fakeCredentials(now), ...changes }, "x64", now), { code: "temporary_test_credentials_unavailable" });
+  for (const changes of [{ runId: "9c86d0fb-b5ce-44fb-a61d-ac21cdf58948" }, { arch: "arm64" }, { useUntilMs: now - 1 }, { createdAtMs: now - 2700001 },
     { fundingCredits: 41 }, { settings: { minimumGenerationCredits: 0 } }, { accountId: "not-a-uuid" }]) {
     const env = fakeCredentials(now);
-    env.PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE = JSON.stringify({ ...JSON.parse(env.PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE), ...changes });
-    assert.throws(() => accountInputs(env, "arm64", now), { code: "temporary_test_credentials_unavailable" });
+    env.PROGRAM_AI_NATIVE_1_0_10_X64_LEASE = JSON.stringify({ ...JSON.parse(env.PROGRAM_AI_NATIVE_1_0_10_X64_LEASE), ...changes });
+    assert.throws(() => accountInputs(env, "x64", now), { code: "temporary_test_credentials_unavailable" });
   }
 });
 
@@ -108,17 +109,80 @@ test("owned native debugger is detached after final observations but before proc
   assert.match(cleanup, /findOwnedPids\(control.expected.executable\)\)\.includes\(control.expected.pid\)/);
 });
 
-test("model selection targets the real visible child trigger, not its surrounding wrapper", () => {
-  let clicked = 0, selector;
-  const trigger = { getBoundingClientRect: () => ({ width: 40, height: 30 }), hasAttribute: () => false,
-    getAttribute: () => null, closest: () => null, click: () => clicked++ };
-  const invoke = Function("document", `return (${clickVisibleModelTrigger.toString()})()`);
-  assert.equal(invoke({ querySelectorAll(value) { selector = value; return [trigger]; } }), true);
+test("model pointer targets require the unique visible enabled hit-tested trigger or exact mini option", () => {
+  let selector, hit;
+  const rect = { left: 10, top: 20, width: 40, height: 30, right: 50, bottom: 50 };
+  const trigger = { disabled: false, getBoundingClientRect: () => rect, hasAttribute: () => false,
+    getAttribute: () => null, closest: () => null, contains: (node) => node === hit, click: () => assert.fail("DOM click forbidden") };
+  const style = { display: "block", visibility: "visible", pointerEvents: "auto", opacity: "1" };
+  const viewport = { innerWidth: 800, innerHeight: 600 };
+  const doc = { visibilityState: "visible", querySelectorAll(value) { selector = value; return [trigger]; }, elementFromPoint: () => hit };
+  const invoke = Function("document", "window", "getComputedStyle", "kind", `return (${modelPointerTarget.toString()})(kind)`);
+  hit = trigger;
+  assert.deepEqual(invoke(doc, viewport, () => style, "trigger"), { x: 30, y: 35, width: 800, height: 600 });
   assert.equal(selector, '[data-action="prompt-model"]');
-  assert.equal(clicked, 1);
-  assert.equal(invoke({ querySelectorAll: () => [trigger, trigger] }), false);
-  assert.equal(invoke({ querySelectorAll: () => [{ ...trigger, closest: () => ({}) }] }), false);
-  assert.equal(clicked, 1);
+  assert.deepEqual(invoke(doc, viewport, () => style, "option"), { x: 30, y: 35, width: 800, height: 600 });
+  assert.match(selector, /data-option-key="openrouter:openai\/gpt-4\.1-mini"/);
+  assert.match(selector, /data-provider-id="openrouter"\]\[data-model-id="openai\/gpt-4\.1-mini"/);
+  assert.equal(invoke(doc, viewport, () => style, "arbitrary-selector"), false);
+  assert.equal(invoke({ ...doc, querySelectorAll: () => [trigger, trigger] }, viewport, () => style, "trigger"), false);
+  for (const changed of [{ disabled: true }, { closest: () => ({}) }, { hasAttribute: (name) => name === "data-disabled" },
+    { getAttribute: () => "true" }, { getBoundingClientRect: () => ({ ...rect, width: 0 }) }])
+    assert.equal(invoke({ ...doc, querySelectorAll: () => [{ ...trigger, ...changed }] }, viewport, () => style, "option"), false);
+  for (const changed of [{ opacity: "0" }, { pointerEvents: "none" }, { visibility: "hidden" }, { display: "none" }])
+    assert.equal(invoke(doc, viewport, () => ({ ...style, ...changed }), "trigger"), false);
+  for (const changed of [{ innerWidth: 30 }, { innerHeight: 35 }, { innerWidth: Infinity }, { innerWidth: 16385 }])
+    assert.equal(invoke(doc, { ...viewport, ...changed }, () => style, "trigger"), false);
+  assert.equal(invoke({ ...doc, visibilityState: "hidden" }, viewport, () => style, "trigger"), false);
+  assert.equal(invoke({ ...doc, elementFromPoint: () => ({}) }, viewport, () => style, "trigger"), false);
+  assert.doesNotMatch(modelPointerTarget.toString(), /\.click\(|dispatchEvent|setModel|store/);
+});
+
+function nativePointerFixture() {
+  const events = [], order = [];
+  const expected = { pid: 123, executable: "/owned/Program AI Desktop", arch: "x64", resources: "/owned/Resources", version: "1.0.10" };
+  let focused = false;
+  const contents = { isDestroyed: () => false, getURL: () => "program-ai://renderer/index.html", getZoomFactor: () => 1,
+    focus: () => { order.push("page_focus"); }, isFocused: () => focused,
+    executeJavaScript: async () => { order.push("hit_test"); return { x: 30, y: 35, width: 800, height: 600 }; },
+    sendInputEvent: (event) => { order.push(event.type); events.push(event); } };
+  const window = { isDestroyed: () => false, isVisible: () => true, isFocused: () => focused, webContents: contents,
+    focus: () => { order.push("window_focus"); queueMicrotask(() => { focused = true; }); } };
+  const electron = { app: { isPackaged: true, getVersion: () => expected.version }, BrowserWindow: { getAllWindows: () => [window] } };
+  const processFixture = { pid: expected.pid, execPath: expected.executable, arch: expected.arch, resourcesPath: expected.resources,
+    getBuiltinModule: () => ({ createRequire: () => () => electron }) };
+  const invoke = Function("process", "expected", `return (${inNativeWindow.toString()})(expected,"fixed-renderer-target",true)`);
+  return { invoke: () => invoke(processFixture, expected), processFixture, expected, electron, window, contents, events, order };
+}
+
+test("owned native model pointer focuses before fresh hit test and sends full ordered same-point mouse sequence", async () => {
+  const fixture = nativePointerFixture();
+  assert.equal(await fixture.invoke(), true);
+  assert.deepEqual(fixture.order, ["window_focus", "page_focus", "hit_test", "mouseMove", "mouseDown", "mouseUp"]);
+  assert.deepEqual(fixture.events, [{ type: "mouseMove", x: 30, y: 35 },
+    { type: "mouseDown", x: 30, y: 35, button: "left", clickCount: 1 },
+    { type: "mouseUp", x: 30, y: 35, button: "left", clickCount: 1 }]);
+  const failing = nativePointerFixture();
+  failing.contents.sendInputEvent = (event) => { failing.events.push(event); if (event.type === "mouseDown") throw new Error("fixed_test_failure"); };
+  await assert.rejects(failing.invoke(), /fixed_test_failure/);
+  assert.deepEqual(failing.events.map((event) => event.type), ["mouseMove", "mouseDown", "mouseUp"]);
+});
+
+test("native model pointer refuses wrong process, duplicate renderer, focus loss and invalid point without sending events", async () => {
+  const wrong = nativePointerFixture(); wrong.processFixture.pid++;
+  await assert.rejects(wrong.invoke(), /owned_native_scope_required/);
+  const duplicate = nativePointerFixture(); duplicate.electron.BrowserWindow.getAllWindows = () => [duplicate.window, duplicate.window];
+  await assert.rejects(duplicate.invoke(), /owned_renderer_required/);
+  const missing = nativePointerFixture(); missing.contents.getURL = () => "https://unowned.example/";
+  await assert.rejects(missing.invoke(), /owned_renderer_required/);
+  for (const point of [false, { x: -1, y: 35, width: 800, height: 600 }, { x: 800, y: 35, width: 800, height: 600 },
+    { x: 30.5, y: 35, width: 800, height: 600 }, { x: 30, y: 35, width: 16385, height: 600 }]) {
+    const fixture = nativePointerFixture(); fixture.contents.executeJavaScript = async () => point;
+    assert.equal(await fixture.invoke(), false); assert.deepEqual(fixture.events, []);
+  }
+  const blurred = nativePointerFixture(); blurred.contents.executeJavaScript = async () => { blurred.window.isFocused = () => false; return { x: 30, y: 35, width: 800, height: 600 }; };
+  assert.equal(await blurred.invoke(), false); assert.deepEqual(blurred.events, []);
+  for (const fixture of [wrong, duplicate, missing]) assert.deepEqual(fixture.events, []);
 });
 
 test("fresh-account tour is dismissed only through its unique normal visible Skip tour button", () => {
@@ -158,6 +222,7 @@ test("live prototype proves exact public native CI and trust before spawning, in
   const source = await readFile(new URL("./native-account-queue.mjs", import.meta.url), "utf8");
   const flow = source.slice(source.indexOf("export async function runNativeAccountQueue()"));
   assert.ok(flow.indexOf("await requireCiContext(pins)") < flow.indexOf("await ensureFreshHost(pins)"));
+  assert.ok(flow.indexOf('check(context.arch === "x64"') < flow.indexOf("await ensureFreshHost(pins)"));
   assert.ok(flow.indexOf("await ensureFreshHost(pins)") < flow.indexOf("accountInputs(process.env"));
   assert.ok(flow.indexOf("await verifyApp(") < flow.indexOf("await startCandidate("));
   assert.match(source, /--inspect-brk=127\.0\.0\.1:/);
@@ -185,8 +250,15 @@ test("public integration uses reviewed relative inputs and owner-only free manua
     assert.ok(source.includes(field));
   for (const guard of ["workflow_dispatch:", "github.event.repository.private == false", "github.actor_id == '88110976'", "github.ref == 'refs/heads/main'", "contents: read", "persist-credentials: false"])
     assert.ok(workflow.includes(guard));
-  assert.match(workflow, /runner: macos-15\n/);
   assert.match(workflow, /runner: macos-15-intel\n/);
+  assert.doesNotMatch(workflow, /arm64|ARM64|default: both|runner: macos-15\n/);
+  assert.equal((workflow.match(/secrets\.PROGRAM_AI_NATIVE_1_0_10_X64_/g) ?? []).length, 3);
+  assert.match(workflow, /default: x64/);
+  const selection = source.slice(source.indexOf("async function selectMini("), source.indexOf("async function dismissProductTour("));
+  assert.match(selection, /control\.modelPointer\("trigger"\)/);
+  assert.match(selection, /control\.modelPointer\("option"\)/);
+  assert.doesNotMatch(selection, /\.click\(|MouseEvent|PointerEvent|setModel|store|textContent\.includes/);
+  assert.match(selection, /getAttribute\('data-provider-id'\)==='openrouter'&&n\.getAttribute\('data-model-id'\)==='openai\/gpt-4\.1-mini'/);
   assert.doesNotMatch(workflow, /schedule:|upload-artifact|actions\/cache|--prod|build:|apple|OPENROUTER_API_KEY|OPENAI_API_KEY|REPLICATE_API_TOKEN/);
   assert.ok(workflow.indexOf("secrets.PROGRAM_AI_NATIVE_") > workflow.indexOf("run: node ci/native-account-queue.mjs"));
 });

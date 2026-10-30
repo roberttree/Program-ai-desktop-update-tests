@@ -4,13 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       architecture:
-        description: Native architecture to verify using the existing browser
+        description: Approved replacement x64 account using the existing browser
         type: choice
         required: true
-        default: both
+        default: x64
         options:
-          - both
-          - arm64
           - x64
 
 permissions:
@@ -32,8 +30,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: arm64
-            runner: macos-15
           - arch: x64
             runner: macos-15-intel
     steps:
@@ -44,12 +40,9 @@ jobs:
       - name: Verify pure test-driver contracts without credentials
         run: node --test ci/*.test.mjs
       - name: Verify actual account handoff and queued file creation
-        if: inputs.architecture == 'both' || matrix.arch == inputs.architecture
+        if: inputs.architecture == 'x64' && matrix.arch == 'x64'
         run: node ci/native-account-queue.mjs
         env:
-          PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL || '' }}
-          PROGRAM_AI_NATIVE_1_0_10_ARM64_PASSWORD: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_PASSWORD || '' }}
-          PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE || '' }}
-          PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL || '' }}
-          PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD || '' }}
-          PROGRAM_AI_NATIVE_1_0_10_X64_LEASE: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_LEASE || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL: ${{ secrets.PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD: ${{ secrets.PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_LEASE: ${{ secrets.PROGRAM_AI_NATIVE_1_0_10_X64_LEASE }}
