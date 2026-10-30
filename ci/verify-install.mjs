@@ -76,7 +76,16 @@ export function normalOpenErrorFlags(message, code) {
     attributeUnavailable: code === -1728 || /unsupported attribute|attribute.*not supported/i.test(text) };
 }
 
-export function inspectNormalOpenAgent(agent, application, classify, errorFlags) {
+export function normalOpenButtonFacts(buttons) {
+  const values = Array.isArray(buttons) ? buttons : [];
+  const extra = values.filter((name) => name !== "Open" && name !== "Cancel");
+  const known = new Map([["Show Web Page", "show_web_page"], ["Help", "help"], ["?", "question_mark"]]);
+  return { cancelButtonCount: Math.min(16, values.filter((name) => name === "Cancel").length),
+    extraButtonCount: Math.min(16, extra.length),
+    extraButtonCategory: extra.length === 0 ? "none" : extra.length > 1 ? "multiple" : known.get(extra[0]) ?? "unknown" };
+}
+
+export function inspectNormalOpenAgent(agent, application, classify, errorFlags, buttonFacts = normalOpenButtonFacts) {
   const observed = { status: "query_failed", querySucceeded: false, agentPresent: false, windowCount: 0, staticTextCount: 0,
     valueAvailableCount: 0, nameFallbackCount: 0, unreadableTextCount: 0, buttonCount: 0, openButtonCount: 0,
     automationDenied: false, accessibilityDenied: false, classifierMatched: false, approved: false,
@@ -118,6 +127,7 @@ export function inspectNormalOpenAgent(agent, application, classify, errorFlags)
     };
     visit(windows[0], 0);
     observed.buttonCount = Math.min(buttons.length, 16); observed.openButtonCount = Math.min(open.length, 16);
+    Object.assign(observed, buttonFacts(buttons));
     const words = text.filter((item) => bounded(item)).join(" ");
     observed.expectedApplication = text.some((item) => bounded(item) && item.includes(application));
     observed.downloadedWarning = /downloaded from the internet/i.test(words);
@@ -150,10 +160,12 @@ export function normalOpenQueryDiagnostic(result) {
     output[name] = value[name] === true;
   output.automationDenied ||= flags.automationDenied; output.accessibilityDenied ||= flags.accessibilityDenied;
   if (output.automationDenied || output.accessibilityDenied) { output.status = "access_denied"; output.querySucceeded = false; }
-  for (const name of ["windowCount", "staticTextCount", "valueAvailableCount", "nameFallbackCount", "unreadableTextCount", "buttonCount", "openButtonCount"])
+  for (const name of ["windowCount", "staticTextCount", "valueAvailableCount", "nameFallbackCount", "unreadableTextCount", "buttonCount", "openButtonCount", "cancelButtonCount", "extraButtonCount"])
     output[name] = Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
+  output.extraButtonCategory = ["none", "multiple", "show_web_page", "help", "question_mark", "unknown"].includes(value.extraButtonCategory) ? value.extraButtonCategory : "unknown";
   output.approved = result.exitCode === 0 && output.querySucceeded && output.status === "approved" && value.approved === true &&
-    output.classifierMatched && output.windowCount === 1 && output.buttonCount === 2 && output.openButtonCount === 1;
+    output.classifierMatched && output.windowCount === 1 && output.buttonCount === 2 && output.openButtonCount === 1 &&
+    output.cancelButtonCount === 1 && output.extraButtonCount === 0 && output.extraButtonCategory === "none";
   return output;
 }
 
@@ -163,11 +175,67 @@ export function programLaunchProcessCounts(text) {
     translocatedProcessCount: Math.min(16, paths.filter((item) => /^\/(?:private\/)?var\/folders\/[^\r\n]*\/AppTranslocation\/[A-Za-z0-9-]+\/d\/Program AI Desktop\.app\/Contents\/MacOS\/Program AI Desktop$/.test(item)).length) };
 }
 
+export function translocatedAppPath(executable) {
+  if (typeof executable !== "string") return undefined;
+  const match = /^(\/private\/var\/folders\/[A-Za-z0-9_-]{2}\/[A-Za-z0-9_-]{1,128}\/T\/AppTranslocation\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\/d\/Program AI Desktop\.app)\/Contents\/MacOS\/Program AI Desktop$/i.exec(executable);
+  return match?.[1];
+}
+
+export function programLaunchCandidates(text) {
+  if (typeof text !== "string" || text.length > 4 * 1024 * 1024) return [];
+  return text.split("\n").flatMap((line) => {
+    const match = /^\s*([1-9][0-9]*)\s+(.+?)\s*$/.exec(line);
+    if (!match || !Number.isSafeInteger(Number(match[1])) || Number(match[1]) <= 1) return [];
+    const executable = match[2], app = translocatedAppPath(executable);
+    return executable === `${INSTALLED_APP}/Contents/MacOS/Program AI Desktop` || app ?
+      [{ pid: Number(match[1]), executable, app: app ?? INSTALLED_APP, mode: app ? "translocated" : "installed" }] : [];
+  });
+}
+
+export function appleTranslocationOrigin(status, original, installedApp) {
+  // These read-only SecurityTool commands call Apple's translocation service.
+  // A path spelling alone is not evidence that Apple created the mapping.
+  // https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/translocate.c
+  const lines = typeof original.stdout === "string" && original.stdout.length <= 8192 ? original.stdout.trim().split("\n").map((line) => line.trim()) : [];
+  return status.exitCode === 0 && status.stdout?.trim() === "TRANSLOCATED" && original.exitCode === 0 &&
+    lines.length === 2 && lines[0] === "Original Path: (note if this is what you passed in then that path is not translocated)" &&
+    lines[1] === installedApp;
+}
+
+export function createProgramLaunchResolver({ pins, arch, expected, installed }, dependencies = {}) {
+  const io = { run, realpath, findOwnedPids, verifyApp, ...dependencies };
+  let verified;
+  return async () => {
+    check(await io.realpath(INSTALLED_APP) === INSTALLED_APP && installed.executable === `${INSTALLED_APP}/Contents/MacOS/Program AI Desktop` &&
+      installed.cdhash === expected.cdhash && installed.asarSha256 === expected.asarSha256, "installed_launch_identity_unverified");
+    const processes = await io.run("/bin/ps", ["-axo", "pid=,comm="], { maxBytes: 4 * 1024 * 1024 });
+    const candidates = programLaunchCandidates(processes.stdout);
+    // Multiple candidates are observations only. No candidate is attached to or
+    // terminated unless the sole exact executable is fully verified below.
+    if (candidates.length !== 1) return candidates;
+    const candidate = candidates[0];
+    check(await io.realpath(candidate.app) === candidate.app && await io.realpath(candidate.executable) === candidate.executable,
+      "translocated_path_not_canonical");
+    if (candidate.mode === "translocated" && (verified?.pid !== candidate.pid || verified?.executable !== candidate.executable)) {
+      const status = await io.run("/usr/bin/security", ["translocate-status-check", candidate.app], { allowFailure: true, maxBytes: 8192 });
+      const original = await io.run("/usr/bin/security", ["translocate-original-path", candidate.app], { allowFailure: true, maxBytes: 8192 });
+      check(appleTranslocationOrigin(status, original, INSTALLED_APP), "translocated_origin_unverified");
+      const actual = await io.verifyApp(candidate.app, { pins, arch });
+      check(actual.executable === candidate.executable && actual.version === expected.version && actual.cdhash === expected.cdhash &&
+        actual.asarSha256 === expected.asarSha256, "translocated_candidate_mismatch", "failed");
+    }
+    const owners = await io.findOwnedPids(candidate.executable);
+    check(owners.length === 1 && owners[0] === candidate.pid, "translocated_process_owner_unverified");
+    verified = candidate;
+    return [candidate];
+  };
+}
+
 const normalOpenHistory = new Map();
 async function approveNormalOpen(application) {
   // Only the unchanged full exact-name Open/Cancel classifier can click. No
   // grants, OS security changes or unclassified dialogs are actionable.
-  const script = `JSON.stringify((${inspectNormalOpenAgent.toString()})(Application("System Events").applicationProcesses.byName("CoreServicesUIAgent"),${JSON.stringify(application)},(${normalOpenDialog.toString()}),(${normalOpenErrorFlags.toString()})))`;
+  const script = `JSON.stringify((${inspectNormalOpenAgent.toString()})(Application("System Events").applicationProcesses.byName("CoreServicesUIAgent"),${JSON.stringify(application)},(${normalOpenDialog.toString()}),(${normalOpenErrorFlags.toString()}),(${normalOpenButtonFacts.toString()})))`;
   const result = await run("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeoutMs: 10000, maxBytes: 16384, allowFailure: true });
   const diagnostic = normalOpenQueryDiagnostic(result);
   const processes = application === "Program AI Desktop" ? await run("/bin/ps", ["-axo", "comm="], { allowFailure: true, timeoutMs: 5000, maxBytes: 4 * 1024 * 1024 }) : undefined;
@@ -187,20 +255,43 @@ export function launchFailureCode(value) {
   return `${observation.context}_${suffix}`;
 }
 
-async function ownedDiagnosticPort(executable, port, application, observation, observe) {
+async function ownedDiagnosticPort(executable, port, application, observation, observe, resolveOwners) {
+  let observedOwner;
+  const ownerFailures = new Set();
   try {
     return await waitFor(async () => {
-      const pids = await findOwnedPids(executable);
-      observation.pidCount = Math.min(pids.length, 2);
-      if (pids.length !== 1) {
+      let owners;
+      try { owners = resolveOwners ? await resolveOwners() : (await findOwnedPids(executable)).map((pid) => ({ pid, executable })); }
+      catch (error) {
+        if (error instanceof VerificationFailure && error.kind === "failed") throw error;
+        if (application === "Program AI Desktop" && ["installed_launch_identity_unverified", "translocated_path_not_canonical",
+          "translocated_origin_unverified", "translocated_process_owner_unverified"].includes(error?.code) && !ownerFailures.has(error.code)) {
+          ownerFailures.add(error.code);
+          console.log(JSON.stringify({ schemaVersion: 1, check: "application_launch_owner", status: "unverified", code: error.code }));
+        }
+        observation.dialogApproved = await approveNormalOpen(application) || observation.dialogApproved;
+        observe(observation); throw error;
+      }
+      observation.pidCount = Math.min(owners.length, 2);
+      if (owners.length !== 1) {
         observation.listener = "not_checked";
         observation.dialogApproved = await approveNormalOpen(application) || observation.dialogApproved;
         observe(observation); return false;
       }
+      if (application === "Program AI Desktop" && ["installed", "translocated"].includes(owners[0].mode) &&
+        observedOwner !== owners[0].mode) {
+        console.log(JSON.stringify({ schemaVersion: 1, check: "application_launch_owner", mode: owners[0].mode, status: "verified" }));
+        observedOwner = owners[0].mode;
+      }
       observation.listener = "unverified"; observe(observation);
-      await verifyListener(port, pids[0], executable);
+      try { await verifyListener(port, owners[0].pid, owners[0].executable); }
+      catch (error) {
+        if (error instanceof VerificationFailure && error.kind === "failed") throw error;
+        observation.dialogApproved = await approveNormalOpen(application) || observation.dialogApproved;
+        observe(observation); return false;
+      }
       observation.listener = "ready"; observe(observation);
-      return pids[0];
+      return owners[0];
     }, { timeoutMs: 90000, code: "normal_native_launch_unverified" });
   } catch (error) {
     if (error instanceof VerificationFailure && error.kind === "failed") throw error;
@@ -280,7 +371,7 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
   const launcher = startHeadfulChrome(profile, port, observation, observeLaunch);
   onLaunch(launcher);
   check(await launcher.started, "headed_browser_spawn_unverified");
-  const pid = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome", observation, observeLaunch);
+  const { pid } = await ownedDiagnosticPort(CHROME_EXECUTABLE, port, "Google Chrome", observation, observeLaunch);
   check(pid === launcher.child.pid, "browser_process_owner_unverified");
   observePhase("browser_connect");
   const page = await connectCdp(port, pid, { executable: CHROME_EXECUTABLE });
@@ -343,7 +434,7 @@ export async function verifyInstall() {
     if (observation.context === "browser") record.browserLaunch = observation;
     if (record.launch?.context !== "application" || observation.context === "application") record.launch = observation;
   };
-  let root, mount, mounted = false, appPid, chromePid, renderer, browserStarted, browserStopped, applicationStarted;
+  let root, mount, mounted = false, appPid, appExecutable, appOwners, chromePid, renderer, browserStarted, browserStopped, applicationStarted;
   let chromeLaunchAttempted = false, appLaunchAttempted = false;
   let guarded = false;
   try {
@@ -413,6 +504,7 @@ export async function verifyInstall() {
     verifyQuarantineInheritance(downloaded.quarantine, installedAttribute.stdout, downloaded.started);
     record.checks.push("finder_install");
     await run("/usr/bin/hdiutil", ["detach", mount]); mounted = false;
+    appOwners = createProgramLaunchResolver({ pins, arch: context.arch, expected, installed });
     const port = await unusedPort();
     const observation = { context: "application", launcherMode: "launch_services", pidCount: 0, listener: "not_checked", openStatus: "pending", openExitCode: null,
       openTimedOut: false, dialogApproved: false };
@@ -422,11 +514,12 @@ export async function verifyInstall() {
       { env: applicationEnvironment(), code: "native_first_launch_unverified", allowFailure: true })
       .then((result) => opening(result, observation, observeLaunch), () => opening({ exitCode: null, timedOut: false }, observation, observeLaunch));
     applicationStarted = launched;
-    appPid = await ownedDiagnosticPort(installed.executable, port, "Program AI Desktop", observation, observeLaunch);
+    const appOwner = await ownedDiagnosticPort(installed.executable, port, "Program AI Desktop", observation, observeLaunch, appOwners);
+    appPid = appOwner.pid; appExecutable = appOwner.executable;
     check(await launched, "native_first_launch_unverified");
     record.checks.push("native_launch");
     observePhase("renderer_connect");
-    renderer = await connectCdp(port, appPid, { executable: installed.executable });
+    renderer = await connectCdp(port, appPid, { executable: appExecutable });
     await waitFor(() => renderer.evaluate("!!window.api?.awaitInitialization"), { timeoutMs: 90000, code: "preload_readiness_unverified" });
     observePhase("sidecar_ready");
     const sidecar = await renderer.evaluate(`(async () => {
@@ -474,10 +567,11 @@ export async function verifyInstall() {
         await browserStarted;
         await applicationStarted;
         if (!appPid && appLaunchAttempted) {
-          const pids = await findOwnedPids(`${INSTALLED_APP}/Contents/MacOS/Program AI Desktop`);
-          if (pids.length === 1) appPid = pids[0];
+          const owners = await appOwners();
+          check(owners.length <= 1, "cleanup_ownership_unverified");
+          if (owners.length === 1) { appPid = owners[0].pid; appExecutable = owners[0].executable; }
         }
-        if (appPid) await terminateOwned(`${INSTALLED_APP}/Contents/MacOS/Program AI Desktop`, appPid);
+        if (appPid) await terminateOwned(appExecutable, appPid);
         if (!chromePid && chromeLaunchAttempted) {
           const pids = await findOwnedPids(CHROME_EXECUTABLE);
           if (pids.length === 1) chromePid = pids[0];

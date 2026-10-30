@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
   createInstallPromiseObserver, createNativeSignatureObserver, installPromiseObservation, nativeShellCommandFixture, payloadChunk,
+  childExitObservation, observeChildExit, createNativeHandoffObserver, createNativeStageCollector, nativeStageObservation,
   rejectionOutcome, replacementObservation, shellSeedObservation, shipItDiagnosticObservation, shipItLogObservation, shipItReadPlan,
   shipItStateObservation, signatureInstallOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
@@ -14,6 +15,67 @@ import {
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
 const state = () => ({ marker: "synthetic\n", store: "unsent canary", session: "session_synthetic_1",
   title: "Synthetic shell chat", messages: ["message_1", "message_2"], signedOut: true });
+
+test("actual child exit metadata retains bounded exit/signal facts without PID or arbitrary error text", () => {
+  const child = new EventEmitter(); child.exitCode = null; child.signalCode = null;
+  const observer = observeChildExit(child);
+  assert.equal(observer.read().exitObserved, false);
+  child.emit("exit", null, "SIGSEGV"); child.emit("close");
+  assert.deepEqual(observer.read(), { exitObserved: true, closeObserved: true, spawnError: false, exitCode: null, signal: "SIGSEGV" });
+  assert.deepEqual(childExitObservation({ exitCode: 0, signalCode: null, pid: 123456, error: "private" }),
+    { exitObserved: true, closeObserved: false, spawnError: false, exitCode: 0, signal: "none" });
+  assert.equal(childExitObservation({ exitCode: 999, signalCode: "secret/path" }).signal, "other");
+  assert.equal(childExitObservation({ exitCode: 999 }).exitCode, null);
+  const projected = replacementObservation({ install: { outcome: "pending", errorClass: "none" }, childExit: observer.read(), nativeStage: { armed: true, frames: 1 } });
+  assert.equal(projected.childExit.signal, "SIGSEGV");
+  assert.equal(projected.nativeStage.errorDomain, "none");
+  assert.doesNotMatch(JSON.stringify(observer.read()), /pid|123456|private/);
+});
+
+test("native handoff observer only listens, preserves SDK listeners and emits strict real-event stages", () => {
+  const native = new EventEmitter(), app = new EventEmitter(), records = [];
+  let sdkErrors = 0;
+  const sdk = () => { sdkErrors++; }; native.on("error", sdk);
+  const observer = createNativeHandoffObserver(native, app, (record) => records.push(record));
+  native.emit("checking-for-update"); native.emit("update-available"); native.emit("update-downloaded");
+  native.emit("before-quit-for-update"); app.emit("before-quit"); app.emit("will-quit"); app.emit("quit");
+  native.emit("error", Object.assign(new Error("private path/token"), { domain: "SQRLUpdaterErrorDomain", code: 3 }));
+  assert.deepEqual(observer.read(), { checking: 1, available: 1, downloaded: 1, notAvailable: 0, errors: 1,
+    beforeQuitForUpdate: 1, appBeforeQuit: 1, appWillQuit: 1, appQuit: 1, saturated: false, errorDomain: "updater", errorCode: 3 });
+  native.emit("error", Object.assign(new Error("private"), { domain: "other private domain", code: 999 }));
+  assert.equal(observer.read().errorDomain, "other"); assert.equal(observer.read().errorCode, null);
+  assert.equal(sdkErrors, 2); assert.equal(native.listeners("error")[0], sdk);
+  assert.doesNotMatch(JSON.stringify(records), /private|path|token|999/);
+  for (let i = 0; i < 20; i++) native.emit("checking-for-update");
+  assert.equal(observer.read().checking, 16); assert.equal(observer.read().saturated, true);
+});
+
+test("coded native stages survive inspector disconnection while ordinary stderr and malformed/oversize lines are discarded", () => {
+  const marker = "PAI_HANDOFF_11111111-2222-4333-8444-555555555555 ";
+  const collector = createNativeStageCollector(marker);
+  const native = new EventEmitter(), app = new EventEmitter();
+  native.on("error", () => {}); // Existing SDK-owned handler, not added by the observer.
+  createNativeHandoffObserver(native, app, (record) => {
+    const frame = marker + JSON.stringify(record) + "\n";
+    collector.push(frame.slice(0, 12)); collector.push(frame.slice(12));
+  });
+  collector.push("raw private path/token\n" + marker + "{malformed}\n" + "x".repeat(5000) + "\n");
+  // No inspector calls are involved in this real emitter→coded pipe path.
+  native.emit("update-downloaded"); native.emit("error", { domain: "SQRLCodeSignatureErrorDomain", code: -1 });
+  const receipt = collector.read();
+  assert.equal(receipt.armed, true); assert.equal(receipt.downloaded, 1);
+  assert.equal(receipt.errorDomain, "signature"); assert.equal(receipt.errorCode, -1);
+  assert.doesNotMatch(JSON.stringify(receipt), /PAI_|11111111|raw|private|path|token/);
+  assert.equal(nativeStageObservation({ errors: 1, errorDomain: "secret", errorCode: -999 }).errorDomain, "other");
+  assert.throws(() => createNativeStageCollector("raw/path"), { code: "native_marker_invalid" });
+});
+
+test("handoff diagnostics do not suppress an otherwise-unhandled native error", () => {
+  const native = new EventEmitter(), app = new EventEmitter();
+  createNativeHandoffObserver(native, app, () => {});
+  assert.equal(native.listenerCount("error"), 0);
+  assert.throws(() => native.emit("error", new Error("synthetic")), /synthetic/);
+});
 
 test("ShipIt log read policy admits only new appended bytes and refuses replaced/truncated/unsafe prior files", () => {
   const before = { status: "owned", dev: 1, ino: 2, size: 100, mtimeMs: 1, ctimeMs: 1 };
@@ -418,6 +480,12 @@ test("live entrypoint remains CI-gated and never uses source imports, global kil
   assert.match(source, /installObserver\.last = installPromiseObservation/);
   assert.match(source, /targetType: "page", executable: base\.executable/);
   assert.match(source, /check: "replacement_diagnostics"/);
+  assert.ok(source.indexOf("const nativeStage = createNativeStageCollector(marker)") < source.indexOf("const child = spawn(base.executable"));
+  assert.ok(source.indexOf("armNativeStage.toString()") < source.indexOf('replacementProbeExpression("schedule")'));
+  const nativeHandoff = source.slice(source.indexOf("export function createNativeHandoffObserver("), source.indexOf("export function createNativeStageCollector("));
+  assert.doesNotMatch(nativeHandoff, /\.emit\(|removeListener|checkForUpdates\(|quitAndInstall\(|\.message/);
+  const finalCleanup = source.slice(source.indexOf("// Capture the actual pre-cleanup child exit"));
+  assert.ok(finalCleanup.indexOf('check: "native_handoff_diagnostics"') < finalCleanup.indexOf("await terminateOwned(executable"));
   assert.match(source, /if \(pins\.version === "1\.0\.10"\) await nativeShellCommandRegression/);
   assert.doesNotMatch(source, /window\.api\.updater\.install\(\)\.catch\(\(\)=>\{\}\)/);
 });

@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { browserSignatureDiagnostic, chromeLaunchArguments, firstLaunchObservation, inspectNormalOpenAgent, launchFailureCode, normalDownloadPreferences,
-  normalOpenDialog, normalOpenErrorFlags, normalOpenQueryDiagnostic, programLaunchProcessCounts, sameBrowserFile, validDownloadEvent, verifyQuarantineInheritance } from "./verify-install.mjs";
+import { appleTranslocationOrigin, browserSignatureDiagnostic, chromeLaunchArguments, createProgramLaunchResolver, firstLaunchObservation, inspectNormalOpenAgent, launchFailureCode, normalDownloadPreferences,
+  normalOpenButtonFacts, normalOpenDialog, normalOpenErrorFlags, normalOpenQueryDiagnostic, programLaunchCandidates, programLaunchProcessCounts, sameBrowserFile,
+  translocatedAppPath, validDownloadEvent, verifyQuarantineInheritance } from "./verify-install.mjs";
 
 test("vendor Chrome signature diagnostics expose fixed categories/exit only and never relax strict verification", () => {
   for (const [stderr, category] of [["private/path: code or signature have been modified", "code_modified"],
@@ -18,12 +19,12 @@ test("vendor Chrome signature diagnostics expose fixed categories/exit only and 
   assert.equal(Object.entries(valid).some(([name, value]) => name !== "exitCode" && value), false);
 });
 
-function normalDialogFixture({ text = '“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?', valueAvailable = true, valueError, role = "AXStaticText" } = {}) {
+function normalDialogFixture({ text = '“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?', valueAvailable = true, valueError, role = "AXStaticText", buttons = ["Cancel", "Open"] } = {}) {
   let clicked = 0;
   const leaf = (role, name) => ({ role: () => role, name: () => name, uiElements: () => [], click: () => { clicked++; } });
   const content = { ...leaf(role, text), attributes: { byName: () => ({ exists: () => valueAvailable,
     value: () => { if (valueError) throw valueError; return text; } }) } };
-  const window = { role: () => "AXWindow", uiElements: () => [content, leaf("AXButton", "Cancel"), leaf("AXButton", "Open")] };
+  const window = { role: () => "AXWindow", uiElements: () => [content, ...buttons.map((name) => leaf("AXButton", name))] };
   return { agent: { exists: () => true, windows: () => [window] }, clicked: () => clicked };
 }
 
@@ -71,6 +72,102 @@ test("normal Open query receipts are fixed and never grant approval on denied or
   for (const stdout of ["null", "true", "[]", "not JSON"])
     assert.equal(normalOpenQueryDiagnostic({ exitCode: 0, stdout }).approved, false);
   assert.equal(normalOpenQueryDiagnostic({ exitCode: null, timedOut: true }).queryTimedOut, true);
+});
+
+test("extra Open-dialog buttons are identified only by bounded categories and never speculatively permitted", () => {
+  for (const [name, category] of [["Show Web Page", "show_web_page"], ["Help", "help"], ["?", "question_mark"], ["private unknown text", "unknown"]]) {
+    const fixture = normalDialogFixture({ buttons: ["Cancel", "Open", name] });
+    const observed = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+    const receipt = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(observed) });
+    assert.equal(receipt.cancelButtonCount, 1); assert.equal(receipt.extraButtonCount, 1);
+    assert.equal(receipt.extraButtonCategory, category); assert.equal(receipt.approved, false); assert.equal(fixture.clicked(), 0);
+    assert.doesNotMatch(JSON.stringify(receipt), /private unknown text|Show Web Page/);
+  }
+  assert.equal(normalOpenButtonFacts(["Open", "Cancel"]).extraButtonCategory, "none");
+  assert.equal(normalOpenButtonFacts(["Open", "Cancel", "Help", "?"]).extraButtonCategory, "multiple");
+  assert.equal(normalOpenButtonFacts(Array(20).fill("private")).extraButtonCount, 16);
+});
+
+const installedApp = "/Applications/Program AI Desktop.app";
+const translocatedApp = "/private/var/folders/ab/owned_test/T/AppTranslocation/12345678-1234-1234-1234-123456789abc/d/Program AI Desktop.app";
+const mainExecutable = (app) => `${app}/Contents/MacOS/Program AI Desktop`;
+const appleOriginResult = (app = installedApp) => ({ exitCode: 0,
+  stdout: `Original Path: (note if this is what you passed in then that path is not translocated)\n\t${app}\n` });
+
+test("AppTranslocation candidates require the exact canonical Apple UUID layout and main executable", () => {
+  const executable = mainExecutable(translocatedApp);
+  assert.equal(translocatedAppPath(executable), translocatedApp);
+  for (const invalid of [executable.replace("/private/var", "/var"), executable.replace("AppTranslocation", "other"),
+    executable.replace("123456789abc", "not-a-uuid"), executable + " Helper", executable.replace("/d/", "/d/../d/"),
+    executable.replace("/T/", "/C/"), executable.replace("Program AI Desktop.app", "Other.app")]) assert.equal(translocatedAppPath(invalid), undefined);
+  assert.deepEqual(programLaunchCandidates(` 42 ${executable}\n 43 ${mainExecutable(installedApp)}\n 1 ${executable}\n 44 /Users/private/other\n`), [
+    { pid: 42, executable, app: translocatedApp, mode: "translocated" },
+    { pid: 43, executable: mainExecutable(installedApp), app: installedApp, mode: "installed" },
+  ]);
+});
+
+test("Apple translocation origin must be confirmed by successful status and exact original installed app", () => {
+  const status = { exitCode: 0, stdout: "\tTRANSLOCATED\n" };
+  assert.equal(appleTranslocationOrigin(status, appleOriginResult(), installedApp), true);
+  for (const invalid of [{ ...status, exitCode: 1 }, { ...status, stdout: "NOT TRANSLOCATED" }, { ...status, stdout: "TRANSLOCATED\nextra" }])
+    assert.equal(appleTranslocationOrigin(invalid, appleOriginResult(), installedApp), false);
+  for (const original of [appleOriginResult("/Applications/Other.app"), { ...appleOriginResult(), exitCode: 1 },
+    { exitCode: 0, stdout: installedApp }, { exitCode: 0, stdout: appleOriginResult().stdout + "extra\n" }])
+    assert.equal(appleTranslocationOrigin(status, original, installedApp), false);
+});
+
+function translocationFixture(options = {}) {
+  const expected = { version: "1.0.10", cdhash: "candidate-cdhash", asarSha256: "candidate-asar" };
+  const installed = { ...expected, executable: mainExecutable(installedApp) };
+  const calls = [];
+  const dependencies = {
+    realpath: async (value) => value === options.nonCanonical ? `${value}/other` : value,
+    run: async (command, args) => {
+      calls.push([command, ...args]);
+      if (command === "/bin/ps") return { exitCode: 0, stdout: options.processes ?? `42 ${mainExecutable(translocatedApp)}\n` };
+      if (args[0] === "translocate-status-check") return { exitCode: 0, stdout: options.status ?? "TRANSLOCATED" };
+      if (args[0] === "translocate-original-path") return appleOriginResult(options.origin ?? installedApp);
+      throw new Error("unexpected fixture command");
+    },
+    verifyApp: async (app, context) => {
+      calls.push(["verifyApp", app, context.arch]);
+      if (options.trustFailure) throw options.trustFailure;
+      return { ...expected, executable: mainExecutable(app), ...options.actual };
+    },
+    findOwnedPids: async (executable) => { calls.push(["findOwnedPids", executable]); return options.pids ?? [42]; },
+  };
+  return { resolve: createProgramLaunchResolver({ pins: { version: "1.0.10" }, arch: "arm64", expected, installed }, dependencies), calls };
+}
+
+test("translocated owner requires Apple origin plus full candidate trust before exact PID ownership", async () => {
+  const fixture = translocationFixture();
+  assert.deepEqual(await fixture.resolve(), [{ pid: 42, executable: mainExecutable(translocatedApp), app: translocatedApp, mode: "translocated" }]);
+  const verifyIndex = fixture.calls.findIndex(([name]) => name === "verifyApp");
+  assert.ok(verifyIndex > fixture.calls.findIndex(([, action]) => action === "translocate-original-path"));
+  assert.ok(verifyIndex < fixture.calls.findIndex(([name]) => name === "findOwnedPids"));
+  assert.equal(fixture.calls[verifyIndex][2], "arm64");
+  await fixture.resolve(); // Cache trust only for the same exact PID/path; recheck process ownership each poll.
+  assert.equal(fixture.calls.filter(([name]) => name === "verifyApp").length, 1);
+  assert.equal(fixture.calls.filter(([name]) => name === "findOwnedPids").length, 2);
+  const direct = translocationFixture({ processes: `42 ${mainExecutable(installedApp)}\n` });
+  assert.equal((await direct.resolve())[0].mode, "installed");
+  assert.equal(direct.calls.some(([name]) => name === "/usr/bin/security" || name === "verifyApp"), false);
+});
+
+test("translocated ownership rejects incorrect origin, canonical path, trust, candidate bytes and process PID", async () => {
+  for (const options of [{ status: "NOT TRANSLOCATED" }, { origin: "/Applications/Other.app" }]) {
+    const fixture = translocationFixture(options);
+    await assert.rejects(fixture.resolve(), { code: "translocated_origin_unverified" });
+    assert.equal(fixture.calls.some(([name]) => name === "verifyApp"), false);
+  }
+  await assert.rejects(translocationFixture({ nonCanonical: translocatedApp }).resolve(), { code: "translocated_path_not_canonical" });
+  for (const actual of [{ version: "1.0.9" }, { cdhash: "wrong" }, { asarSha256: "wrong" }, { executable: mainExecutable(installedApp) }])
+    await assert.rejects(translocationFixture({ actual }).resolve(), { code: "translocated_candidate_mismatch", kind: "failed" });
+  await assert.rejects(translocationFixture({ trustFailure: Object.assign(new Error("fixed"), { code: "app_signature_invalid" }) }).resolve(), { code: "app_signature_invalid" });
+  for (const pids of [[], [43], [42, 43]]) await assert.rejects(translocationFixture({ pids }).resolve(), { code: "translocated_process_owner_unverified" });
+  const ambiguous = translocationFixture({ processes: `42 ${mainExecutable(translocatedApp)}\n43 ${mainExecutable(installedApp)}\n` });
+  assert.equal((await ambiguous.resolve()).length, 2);
+  assert.equal(ambiguous.calls.some(([name]) => name === "verifyApp" || name === "findOwnedPids"), false);
 });
 
 test("AppTranslocation process facts count only expected main binaries and never expose paths or PIDs", () => {
