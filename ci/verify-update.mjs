@@ -426,22 +426,116 @@ export async function bootstrapMain(main, expected, feedUrl, observePhase) {
   } finally { stop(); }
 }
 
+export function childExitObservation(value) {
+  const signals = ["SIGABRT", "SIGBUS", "SIGSEGV", "SIGILL", "SIGTRAP", "SIGKILL", "SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"];
+  const signal = value.signalCode ?? (value.signal === "none" ? null : value.signal);
+  return { exitObserved: value.exitObserved === true || value.exitCode != null || signal != null,
+    closeObserved: value.closeObserved === true, spawnError: value.spawnError === true,
+    exitCode: Number.isInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 255 ? value.exitCode : null,
+    signal: signal == null ? "none" : signals.includes(signal) ? signal : "other" };
+}
+
+export function observeChildExit(child) {
+  let exitObserved = false, closeObserved = false, spawnError = false, exitCode = null, signalCode = null;
+  child.on("exit", (code, signal) => { exitObserved = true; exitCode = code; signalCode = signal; });
+  child.on("close", () => { closeObserved = true; });
+  child.on("error", () => { spawnError = true; });
+  return { read: () => childExitObservation({ exitObserved, closeObserved, spawnError,
+    exitCode: child.exitCode ?? exitCode, signalCode: child.signalCode ?? signalCode }) };
+}
+
+export function nativeStageObservation(value = {}) {
+  const result = {};
+  for (const name of ["checking", "available", "downloaded", "notAvailable", "errors", "beforeQuitForUpdate", "appBeforeQuit", "appWillQuit", "appQuit"])
+    result[name] = Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
+  const codes = { signature: [-1, -2], updater: [2, 3, 4, 5, 6, 7, 8], installer: [-1, -2, -3, -4, -5, -6, -7, -8, -9], shipit_request: [1, 2, 3], shipit_launcher: [1] };
+  const domain = Object.hasOwn(codes, value.errorDomain) ? value.errorDomain : value.errorDomain === "none" || value.errorDomain == null && result.errors === 0 ? "none" : "other";
+  return { ...result, saturated: value.saturated === true, errorDomain: domain,
+    errorCode: codes[domain]?.includes(value.errorCode) ? value.errorCode : null };
+}
+
+// Read-only event listeners. No checks/quit calls, event injection, cancellation,
+// or listener removals. Publish only counters and strict primary error enums.
+export function createNativeHandoffObserver(native, app, publish) {
+  const state = { checking: 0, available: 0, downloaded: 0, notAvailable: 0, errors: 0,
+    beforeQuitForUpdate: 0, appBeforeQuit: 0, appWillQuit: 0, appQuit: 0, saturated: false, errorDomain: "none", errorCode: null };
+  let published = 0;
+  const send = () => { if (published >= 128) return; published++; try { publish({ ...state }); } catch {} };
+  const bump = (name) => { if (state[name] === 16) state.saturated = true; else state[name]++; send(); };
+  for (const [event, name] of [["checking-for-update", "checking"], ["update-available", "available"], ["update-downloaded", "downloaded"],
+    ["update-not-available", "notAvailable"], ["before-quit-for-update", "beforeQuitForUpdate"]]) native.on(event, () => bump(name));
+  // Do not turn an otherwise-unhandled EventEmitter error into a handled one.
+  // The shipping SDK normally owns a persistent error listener already.
+  if (native.listenerCount("error") > 0) native.on("error", (error) => {
+    const domains = { SQRLCodeSignatureErrorDomain: ["signature", [-1, -2]], SQRLUpdaterErrorDomain: ["updater", [2, 3, 4, 5, 6, 7, 8]],
+      SQRLInstallerErrorDomain: ["installer", [-1, -2, -3, -4, -5, -6, -7, -8, -9]], SQRLShipItRequestErrorDomain: ["shipit_request", [1, 2, 3]], SQRLShipItLauncherErrorDomain: ["shipit_launcher", [1]] };
+    const known = Object.hasOwn(domains, error?.domain) ? domains[error.domain] : undefined;
+    state.errorDomain = known ? known[0] : "other";
+    state.errorCode = known?.[1].includes(error?.code) ? error.code : null;
+    bump("errors");
+  });
+  for (const [event, name] of [["before-quit", "appBeforeQuit"], ["will-quit", "appWillQuit"], ["quit", "appQuit"]]) app.on(event, () => bump(name));
+  send();
+  return { read: () => ({ ...state }) };
+}
+
+export function createNativeStageCollector(marker) {
+  check(/^PAI_HANDOFF_[a-f0-9-]{36} $/.test(marker), "native_marker_invalid");
+  let line = "", dropping = false, armed = false, frames = 0, last = nativeStageObservation();
+  return {
+    push(chunk) {
+      // Never retain ordinary stderr. Only a short exact-prefix frame can be
+      // buffered; oversized lines are discarded through the next newline.
+      const text = String(chunk).slice(-65536);
+      for (const character of text) {
+        if (dropping) { if (character === "\n") dropping = false; continue; }
+        if (character === "\n") {
+          if (line.startsWith(marker) && line.length <= marker.length + 1024) {
+            try { last = nativeStageObservation(JSON.parse(line.slice(marker.length))); armed = true; frames = Math.min(128, frames + 1); } catch {}
+          }
+          line = ""; continue;
+        }
+        line += character;
+        if (line.length <= marker.length ? !marker.startsWith(line) : line.length > marker.length + 1024) { line = ""; dropping = true; }
+      }
+    },
+    read: () => ({ armed, frames, ...last }),
+  };
+}
+
+function armNativeStage(expected, data, factory) {
+  const require = process.getBuiltinModule("module").createRequire(process.resourcesPath + "/app.asar/package.json");
+  const electron = require("electron");
+  if (process.pid !== expected.pid || process.execPath !== expected.executable || process.resourcesPath !== expected.resources ||
+    !electron.app.isPackaged || electron.app.getVersion() !== expected.version || !/^PAI_HANDOFF_[a-f0-9-]{36} $/.test(data.marker)) throw new Error("owned_scope_required");
+  const key = Symbol.for("program-ai-public-native-stage-observer");
+  if (globalThis[key]) return true;
+  globalThis[key] = factory(electron.autoUpdater, electron.app, (value) => {
+    try { process.stderr.write(data.marker + JSON.stringify(value) + "\n"); } catch {}
+  });
+  return true;
+}
+
 async function startBase(base, arch, version, feedUrl, observePhase) {
   const port = await unusedPort();
   const rendererPort = await unusedPort();
+  const marker = `PAI_HANDOFF_${randomUUID()} `;
+  const nativeStage = createNativeStageCollector(marker);
   observePhase("base_spawn");
   const child = spawn(base.executable, [`--inspect-brk=127.0.0.1:${port}`, `--remote-debugging-port=${rendererPort}`, "--remote-debugging-address=127.0.0.1"], {
     env: applicationEnvironment(), stdio: ["ignore", "ignore", "pipe"],
   });
-  child.stderr.on("data", () => {}); // Consume but never retain app diagnostics.
-  child.on("error", () => {});
+  const childExit = observeChildExit(child);
+  child.stderr.on("data", (chunk) => nativeStage.push(chunk)); // Non-coded app stderr is discarded.
   check(Number.isSafeInteger(child.pid) && child.pid > 1, "owned_spawn_unverified");
   observePhase("base_diagnostic_connect");
   const main = await connectCdp(port, child.pid, { targetType: "node", executable: base.executable, timeoutMs: 30000 });
   const expected = { pid: child.pid, executable: base.executable, resources: path.resolve(base.executable, "../../Resources"), arch, version };
   try { await bootstrapMain(main, expected, feedUrl, observePhase); }
   catch (error) { main.close(); throw error; }
-  return { main, expected, child, rendererPort };
+  // Diagnostic failure never changes a native verification/pass gate.
+  await evaluate(main, `(${armNativeStage.toString()})(${JSON.stringify(expected)},${JSON.stringify({ marker })},(${createNativeHandoffObserver.toString()}))`).catch(() => undefined);
+  return { main, expected, child, rendererPort, handoff: { childExit, nativeStage } };
 }
 
 async function windowValue(control, expression, timeoutMs = 30000) {
@@ -734,7 +828,11 @@ export function replacementObservation(value) {
     installedCdhashChecked: value.installedCdhashChecked === true, installedAsarChecked: value.installedAsarChecked === true,
     installedCandidateCdhashMatches: value.installedCandidateCdhashMatches === true, installedCandidateAsarMatches: value.installedCandidateAsarMatches === true,
     installedBaseCdhashMatches: value.installedBaseCdhashMatches === true, installedBaseAsarMatches: value.installedBaseAsarMatches === true,
-    ...(value.shipIt ? { shipIt: shipItDiagnosticObservation(value.shipIt) } : {}) };
+    ...(value.shipIt ? { shipIt: shipItDiagnosticObservation(value.shipIt) } : {}),
+    ...(value.childExit ? { childExit: childExitObservation(value.childExit) } : {}),
+    ...(value.nativeStage ? { nativeStage: { armed: value.nativeStage.armed === true,
+      frames: Number.isInteger(value.nativeStage.frames) && value.nativeStage.frames >= 0 ? Math.min(128, value.nativeStage.frames) : 0,
+      ...nativeStageObservation(value.nativeStage) } } : {}) };
 }
 
 async function readInstallObserver(observer) {
@@ -763,6 +861,7 @@ async function reportReplacement(base, candidate, oldPid, observer) {
     installedVersion, installedCdhashChecked: !!cdhash, installedAsarChecked: !!asar,
     installedCandidateCdhashMatches: !!cdhash && cdhash === candidate.cdhash, installedCandidateAsarMatches: !!asar && asar === candidate.asarSha256,
     installedBaseCdhashMatches: !!cdhash && cdhash === base.cdhash, installedBaseAsarMatches: !!asar && asar === base.asarSha256, shipIt,
+    childExit: observer.handoff?.childExit.read(), nativeStage: observer.handoff?.nativeStage.read(),
   }) }));
 }
 
@@ -908,7 +1007,7 @@ export async function runUpdateVerification(scenario) {
     // Schedule the real preload request in the existing renderer, then close
     // the owned inspector before that request can trigger native quit/relaunch.
     const renderer = await connectCdp(control.rendererPort, oldPid, { targetType: "page", executable: base.executable, timeoutMs: 5000 }).catch(() => undefined);
-    installObserver = { renderer, last: { outcome: "pending", errorClass: "none" }, shipIt: await captureShipItBaseline(base).catch(() => undefined) };
+    installObserver = { renderer, last: { outcome: "pending", errorClass: "none" }, shipIt: await captureShipItBaseline(base).catch(() => undefined), handoff: control.handoff };
     installObserver.last = installPromiseObservation(await windowValue(control, replacementProbeExpression("schedule")));
     check(await evaluate(control.main, "(()=>{setTimeout(()=>process.getBuiltinModule('inspector').close(),0);return true})()"),
       "install_diagnostic_close_unverified");
@@ -933,6 +1032,12 @@ export async function runUpdateVerification(scenario) {
     status = error instanceof VerificationFailure ? error.kind : "unverified";
     code = error instanceof VerificationFailure ? error.code : "unexpected_harness_error";
   } finally {
+    // Capture the actual pre-cleanup child exit, never a SIGTERM sent by this
+    // harness's later owned-process cleanup. No raw stderr is published.
+    const handoff = installObserver?.handoff ?? control?.handoff;
+    if (status !== "passed" && handoff) console.log(JSON.stringify({ schemaVersion: 1, check: "native_handoff_diagnostics",
+      childExit: childExitObservation(handoff.childExit.read()), nativeStage: { armed: handoff.nativeStage.read().armed,
+        frames: handoff.nativeStage.read().frames, ...nativeStageObservation(handoff.nativeStage.read()) } }));
     installObserver?.renderer?.close();
     control?.main.close();
     if (executable) {

@@ -11,6 +11,7 @@ on:
         options:
           - install-and-update
           - update-failures
+          - final-checks
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ concurrency:
 
 jobs:
   verify:
-    if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main' && inputs.suite == 'install-and-update'
+    if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main' && (inputs.suite == 'install-and-update' || inputs.suite == 'final-checks')
     name: ${{ matrix.arch }} ${{ matrix.check }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
@@ -55,7 +56,7 @@ jobs:
         run: node ci/verify-install.mjs --arch ${{ matrix.arch }}
       - name: Verify the real signed update and failure behavior
         if: matrix.check == 'update'
-        run: node ci/verify-update.mjs --scenario positive
+        run: node ci/verify-update.mjs --scenario ${{ inputs.suite == 'final-checks' && 'interrupted' || 'positive' }}
 
   update-failures:
     if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main' && inputs.suite == 'update-failures'
