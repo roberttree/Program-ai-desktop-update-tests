@@ -27,6 +27,19 @@ export function validDownloadEvent(event, artifact) {
   try { approvedRedirect(event.url); return true; } catch { return false; }
 }
 
+export function browserSignatureDiagnostic(result) {
+  const exitCode = Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255 ? result.exitCode : null;
+  const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.slice(0, 131072);
+  const failed = exitCode !== 0;
+  const fields = { code_modified: failed && /code or signature (?:have|has) been modified|file modified:/i.test(text),
+    resource_missing: failed && /sealed resource is missing|file missing:|resource.*not found/i.test(text),
+    unsealed: failed && /unsealed (?:contents|resource)|unsealed directory/i.test(text),
+    not_signed: failed && /not signed at all|code object is not signed|no signature found/i.test(text),
+    trust_service: failed && /trust service|trust evaluation|CSSMERR_TP|errSecInternalComponent|unable to build chain|certificate chain/i.test(text) };
+  // These are diagnostic-message predicates, not a replacement for verification.
+  return { exitCode, ...fields, unknown: failed && !Object.values(fields).some(Boolean) };
+}
+
 export function sameBrowserFile(before, after, quarantineBefore, quarantineAfter) {
   return before.isFile() && after.isFile() && !before.isSymbolicLink() && !after.isSymbolicLink() &&
     before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.size > 0 &&
@@ -56,28 +69,114 @@ export function verifyQuarantineInheritance(source, installed, startedMs, nowMs 
   return true;
 }
 
-async function approveNormalOpen(application) {
-  // Only the ordinary, exact-name Open/Cancel confirmation is eligible. This
-  // does not click "Open Anyway", grant TCC, or change a security setting.
-  const script = `(() => {
-    const agent = Application("System Events").applicationProcesses.byName("CoreServicesUIAgent");
-    if (!agent.exists()) return false;
-    const windows = agent.windows();
-    if (windows.length !== 1) return false;
+export function normalOpenErrorFlags(message, code) {
+  const text = typeof message === "string" ? message.slice(0, 16384) : "";
+  return { automationDenied: code === -1743 || /not authorized to send apple events|not permitted to send apple events|\(-1743\)/i.test(text),
+    accessibilityDenied: code === -25211 || /not allowed assistive access|accessibility access (?:is )?denied|AXErrorAPIDisabled|\(-25211\)/i.test(text),
+    attributeUnavailable: code === -1728 || /unsupported attribute|attribute.*not supported/i.test(text) };
+}
+
+export function inspectNormalOpenAgent(agent, application, classify, errorFlags) {
+  const observed = { status: "query_failed", querySucceeded: false, agentPresent: false, windowCount: 0, staticTextCount: 0,
+    valueAvailableCount: 0, nameFallbackCount: 0, unreadableTextCount: 0, buttonCount: 0, openButtonCount: 0,
+    automationDenied: false, accessibilityDenied: false, classifierMatched: false, approved: false,
+    expectedApplication: false, downloadedWarning: false, openConfirmation: false, blockedWarning: false };
+  const bounded = (value) => typeof value === "string" && value.length > 0 && value.length <= 2048;
+  const failure = (error) => {
+    const flags = errorFlags(error?.message, error?.number);
+    observed.automationDenied ||= flags.automationDenied;
+    observed.accessibilityDenied ||= flags.accessibilityDenied;
+    return flags;
+  };
+  try {
+    if (!agent.exists()) { observed.querySucceeded = true; observed.status = "agent_missing"; return observed; }
+    observed.agentPresent = true;
+    const windows = agent.windows(); observed.windowCount = Math.min(windows.length, 16);
+    if (windows.length !== 1) { observed.querySucceeded = true; observed.status = "window_count"; return observed; }
     const text = [], buttons = [], open = []; let visited = 0;
     const visit = (node, depth) => {
       if (++visited > 256 || depth > 10) throw new Error("bounded");
       const role = node.role();
-      if (role === "AXStaticText") text.push(node.value());
-      if (role === "AXButton") { buttons.push(node.name()); if (node.name() === "Open") open.push(node); }
-      node.uiElements().forEach(child => visit(child, depth + 1));
+      if (role === "AXStaticText") {
+        observed.staticTextCount = Math.min(16, observed.staticTextCount + 1);
+        let value;
+        try { const attribute = node.attributes.byName("AXValue"); if (attribute.exists()) value = attribute.value(); }
+        catch (error) { const flags = failure(error); if (!flags.attributeUnavailable || flags.automationDenied || flags.accessibilityDenied) throw error; }
+        if (typeof value === "string" && value.length > 2048) throw new Error("bounded");
+        if (bounded(value) && value.trim()) observed.valueAvailableCount = Math.min(16, observed.valueAvailableCount + 1);
+        else {
+          // Name is read only for AXStaticText whose AXValue is unavailable.
+          // The original full normalOpenDialog classifier is not relaxed.
+          value = node.name();
+          if (bounded(value) && value.trim()) observed.nameFallbackCount = Math.min(16, observed.nameFallbackCount + 1);
+          else { observed.unreadableTextCount = Math.min(16, observed.unreadableTextCount + 1); value = undefined; }
+        }
+        text.push(value);
+      }
+      if (role === "AXButton") { const name = node.name(); buttons.push(name); if (name === "Open") open.push(node); }
+      node.uiElements().forEach((child) => visit(child, depth + 1));
     };
     visit(windows[0], 0);
-    if (!(${normalOpenDialog.toString()})({text, buttons}, ${JSON.stringify(application)}) || open.length !== 1) return false;
-    open[0].click(); return true;
-  })()`;
-  const result = await run("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeoutMs: 10000, allowFailure: true });
-  return result.exitCode === 0 && result.stdout.trim() === "true";
+    observed.buttonCount = Math.min(buttons.length, 16); observed.openButtonCount = Math.min(open.length, 16);
+    const words = text.filter((item) => bounded(item)).join(" ");
+    observed.expectedApplication = text.some((item) => bounded(item) && item.includes(application));
+    observed.downloadedWarning = /downloaded from the internet/i.test(words);
+    observed.openConfirmation = /are you sure.*open/i.test(words);
+    observed.blockedWarning = /damaged|malware|cannot be opened|can.t be opened|unidentified|open anyway|trash|bin/i.test(words);
+    observed.querySucceeded = true;
+    observed.classifierMatched = classify({ text, buttons }, application) && open.length === 1;
+    if (!observed.classifierMatched || observed.automationDenied || observed.accessibilityDenied) { observed.status = "classifier_nonmatch"; return observed; }
+    open[0].click(); observed.approved = true; observed.status = "approved";
+  } catch (error) {
+    failure(error); observed.querySucceeded = false;
+    observed.status = observed.automationDenied || observed.accessibilityDenied ? "access_denied" : error?.message === "bounded" ? "bounded" : "query_failed";
+  }
+  return observed;
+}
+
+export function normalOpenQueryDiagnostic(result) {
+  let value = {};
+  try {
+    if (result.exitCode === 0 && result.stdout?.length <= 16384) {
+      const parsed = JSON.parse(result.stdout);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) value = parsed;
+    }
+  } catch {}
+  const flags = normalOpenErrorFlags(result.stderr);
+  const output = { queryExitCode: Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255 ? result.exitCode : null,
+    queryTimedOut: result.timedOut === true, querySucceeded: result.exitCode === 0 && value.querySucceeded === true,
+    status: ["agent_missing", "window_count", "classifier_nonmatch", "approved", "access_denied", "bounded", "query_failed"].includes(value.status) ? value.status : "query_failed" };
+  for (const name of ["agentPresent", "automationDenied", "accessibilityDenied", "classifierMatched", "expectedApplication", "downloadedWarning", "openConfirmation", "blockedWarning"])
+    output[name] = value[name] === true;
+  output.automationDenied ||= flags.automationDenied; output.accessibilityDenied ||= flags.accessibilityDenied;
+  if (output.automationDenied || output.accessibilityDenied) { output.status = "access_denied"; output.querySucceeded = false; }
+  for (const name of ["windowCount", "staticTextCount", "valueAvailableCount", "nameFallbackCount", "unreadableTextCount", "buttonCount", "openButtonCount"])
+    output[name] = Number.isInteger(value[name]) && value[name] >= 0 ? Math.min(16, value[name]) : 0;
+  output.approved = result.exitCode === 0 && output.querySucceeded && output.status === "approved" && value.approved === true &&
+    output.classifierMatched && output.windowCount === 1 && output.buttonCount === 2 && output.openButtonCount === 1;
+  return output;
+}
+
+export function programLaunchProcessCounts(text) {
+  const paths = typeof text === "string" ? text.split("\n").map((line) => line.trim()) : [];
+  return { installedProcessCount: Math.min(16, paths.filter((item) => item === `${INSTALLED_APP}/Contents/MacOS/Program AI Desktop`).length),
+    translocatedProcessCount: Math.min(16, paths.filter((item) => /^\/(?:private\/)?var\/folders\/[^\r\n]*\/AppTranslocation\/[A-Za-z0-9-]+\/d\/Program AI Desktop\.app\/Contents\/MacOS\/Program AI Desktop$/.test(item)).length) };
+}
+
+const normalOpenHistory = new Map();
+async function approveNormalOpen(application) {
+  // Only the unchanged full exact-name Open/Cancel classifier can click. No
+  // grants, OS security changes or unclassified dialogs are actionable.
+  const script = `JSON.stringify((${inspectNormalOpenAgent.toString()})(Application("System Events").applicationProcesses.byName("CoreServicesUIAgent"),${JSON.stringify(application)},(${normalOpenDialog.toString()}),(${normalOpenErrorFlags.toString()})))`;
+  const result = await run("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeoutMs: 10000, maxBytes: 16384, allowFailure: true });
+  const diagnostic = normalOpenQueryDiagnostic(result);
+  const processes = application === "Program AI Desktop" ? await run("/bin/ps", ["-axo", "comm="], { allowFailure: true, timeoutMs: 5000, maxBytes: 4 * 1024 * 1024 }) : undefined;
+  const record = { schemaVersion: 1, check: "normal_open_dialog", subject: application === "Program AI Desktop" ? "application" : "browser",
+    ...diagnostic, processCountsChecked: processes?.exitCode === 0,
+    ...programLaunchProcessCounts(processes?.exitCode === 0 ? processes.stdout : "") };
+  const serialized = JSON.stringify(record), previous = normalOpenHistory.get(record.subject) ?? { count: 0 };
+  if (previous.count < 16 && previous.last !== serialized) { console.log(serialized); normalOpenHistory.set(record.subject, { last: serialized, count: previous.count + 1 }); }
+  return diagnostic.approved;
 }
 
 export function launchFailureCode(value) {
@@ -156,7 +255,9 @@ async function browserDownload(root, downloads, artifact, onLaunch, observePhase
   const info = JSON.parse((await run("/usr/bin/plutil", ["-convert", "json", "-o", "-", `${CHROME}/Contents/Info.plist`])).stdout);
   check(info.CFBundleIdentifier === "com.google.Chrome" && info.LSFileQuarantineEnabled === true,
     "browser_quarantine_capability_unverified");
-  await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", CHROME], { code: "browser_signature_unverified" });
+  const browserSignature = await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", CHROME], { allowFailure: true, maxBytes: 65536 });
+  console.log(JSON.stringify({ schemaVersion: 1, check: "browser_signature", ...browserSignatureDiagnostic(browserSignature) }));
+  check(browserSignature.exitCode === 0, "browser_signature_unverified");
   await run("/usr/sbin/spctl", ["--assess", "--type", "execute", CHROME], { code: "browser_trust_unverified" });
   check((await findOwnedPids(CHROME_EXECUTABLE)).length === 0, "preexisting_browser_process");
   // Read-only capability facts on the guarded disposable CI host. No GUI/TCC
