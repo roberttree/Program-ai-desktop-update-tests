@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { appleTranslocationOrigin, browserSignatureDiagnostic, chromeLaunchArguments, createProgramLaunchResolver, firstLaunchObservation, inspectNormalOpenAgent, launchFailureCode, normalDownloadPreferences,
   normalOpenButtonFacts, normalOpenDialog, normalOpenErrorFlags, normalOpenQueryDiagnostic, programLaunchCandidates, programLaunchProcessCounts, sameBrowserFile,
@@ -19,12 +20,13 @@ test("vendor Chrome signature diagnostics expose fixed categories/exit only and 
   assert.equal(Object.entries(valid).some(([name, value]) => name !== "exitCode" && value), false);
 });
 
-function normalDialogFixture({ text = '“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?', valueAvailable = true, valueError, role = "AXStaticText", buttons = ["Cancel", "Open"] } = {}) {
+function normalDialogFixture({ text = '“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?', valueAvailable = true, valueError, role = "AXStaticText", buttons = ["Cancel", "Open"], extraSubrole } = {}) {
   let clicked = 0;
   const leaf = (role, name) => ({ role: () => role, name: () => name, uiElements: () => [], click: () => { clicked++; } });
   const content = { ...leaf(role, text), attributes: { byName: () => ({ exists: () => valueAvailable,
     value: () => { if (valueError) throw valueError; return text; } }) } };
-  const window = { role: () => "AXWindow", uiElements: () => [content, ...buttons.map((name) => leaf("AXButton", name))] };
+  const window = { role: () => "AXWindow", uiElements: () => [content, ...buttons.map((name) => ({ ...leaf("AXButton", name),
+    attributes: { byName: (attribute) => ({ exists: () => attribute === "AXSubrole" && extraSubrole !== undefined, value: () => extraSubrole }) } }))] };
   return { agent: { exists: () => true, windows: () => [window] }, clicked: () => clicked };
 }
 
@@ -86,6 +88,26 @@ test("extra Open-dialog buttons are identified only by bounded categories and ne
   assert.equal(normalOpenButtonFacts(["Open", "Cancel"]).extraButtonCategory, "none");
   assert.equal(normalOpenButtonFacts(["Open", "Cancel", "Help", "?"]).extraButtonCategory, "multiple");
   assert.equal(normalOpenButtonFacts(Array(20).fill("private")).extraButtonCount, 16);
+});
+
+test("unknown extra button labels are RAM-only and public diagnostics contain only bounded kinds, subrole and SHA256", () => {
+  for (const [name, nameKind] of [[undefined, "missing"], ["", "empty"], ["private unrecognized label", "nonempty"]]) {
+    const fixture = normalDialogFixture({ buttons: ["Cancel", "Open", name], extraSubrole: "AXHelpButton" });
+    const privateValue = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+    const receipt = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(privateValue) });
+    assert.equal(receipt.extraButtonCategory, "ax_help_button");
+    assert.deepEqual(receipt.extraButtons, [{ nameKind, nameLength: name?.length ?? 0, nameTooLong: false, subrole: "AXHelpButton",
+      labelSha256: typeof name === "string" ? createHash("sha256").update(name).digest("hex") : null }]);
+    assert.equal(receipt.approved, false); assert.equal(fixture.clicked(), 0);
+    assert.doesNotMatch(JSON.stringify(receipt), /private unrecognized label|privateExtraButtons|"label"/);
+  }
+  const oversized = normalDialogFixture({ buttons: ["Cancel", "Open", "x".repeat(65)], extraSubrole: "private unknown subrole" });
+  const receipt = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(inspectNormalOpenAgent(oversized.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags)) });
+  assert.deepEqual(receipt.extraButtons, [{ nameKind: "nonempty", nameLength: 64, nameTooLong: true, subrole: "other", labelSha256: null }]);
+  assert.equal(receipt.approved, false); assert.doesNotMatch(JSON.stringify(receipt), /private unknown subrole/);
+  const malformed = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify({ privateExtraButtons: Array(20).fill({ nameKind: "private", nameLength: 1000, subrole: "private", label: "/private/value" }) }) });
+  assert.equal(malformed.extraButtons.length, 16);
+  assert.doesNotMatch(JSON.stringify(malformed), /\/private\/value|"private"/);
 });
 
 const installedApp = "/Applications/Program AI Desktop.app";

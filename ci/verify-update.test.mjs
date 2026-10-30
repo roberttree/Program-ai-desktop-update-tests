@@ -8,6 +8,7 @@ import {
   SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
   createInstallPromiseObserver, createNativeSignatureObserver, installPromiseObservation, nativeShellCommandFixture, payloadChunk,
   childExitObservation, observeChildExit, createNativeHandoffObserver, createNativeStageCollector, nativeStageObservation,
+  readyPhaseObservation, rendererReadySnapshot,
   rejectionOutcome, replacementObservation, shellSeedObservation, shipItDiagnosticObservation, shipItLogObservation, shipItReadPlan,
   shipItStateObservation, signatureInstallOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
@@ -15,6 +16,40 @@ import {
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
 const state = () => ({ marker: "synthetic\n", store: "unsent canary", session: "session_synthetic_1",
   title: "Synthetic shell chat", messages: ["message_1", "message_2"], signedOut: true });
+
+test("failure-ready snapshot observes preload presence and auth without starting sidecar initialization", async () => {
+  let initializations = 0;
+  const api = { awaitInitialization() { initializations++; throw new Error("must not run") }, updater: { check() {}, install() {} },
+    storeSet() {}, storeGet() {}, programAICloudAuth: { async getState() { return { status: "signed_in", user: { email: "private@example.invalid" } } } } };
+  const result = await rendererReadySnapshot(api, { body: { innerText: "Synthetic meaningful renderer content; never emitted." } });
+  assert.equal(initializations, 0);
+  assert.equal(result.apiPresent, true);
+  assert.deepEqual(result.preload, { awaitInitialization: true, updaterCheck: true, updaterInstall: true, storeSet: true, storeGet: true, authGetState: true });
+  assert.equal(result.documentMeaningful, true); assert.equal(result.authStatus, "signed_in"); assert.equal(result.authReason, "none");
+  assert.doesNotMatch(JSON.stringify(result), /private|@|Synthetic|emitted/);
+  assert.equal((await rendererReadySnapshot({}, { body: { innerText: "Loading" } })).documentMeaningful, false);
+});
+
+test("ready-phase auth statuses and reasons are fixed and exclude raw errors or unknown values", async () => {
+  for (const [state, status, reason] of [[{ status: "signed_out" }, "signed_out", "none"], [{ status: "signing_in" }, "authenticating", "none"],
+    [{ status: "unavailable", reason: "secure_storage" }, "unavailable", "secure_storage"], [{ status: "error", message: "private error" }, "error", "auth_error"],
+    [{ status: "private value", reason: "private reason" }, "unknown", "unknown"]]) {
+    const result = await rendererReadySnapshot({ programAICloudAuth: { getState: async () => state } }, {});
+    assert.equal(result.authStatus, status); assert.equal(result.authReason, reason);
+    assert.doesNotMatch(JSON.stringify(result), /private/);
+  }
+  const failed = await rendererReadySnapshot({ programAICloudAuth: { getState: async () => { throw new Error("private") } } }, {});
+  assert.equal(failed.authReason, "request_failed");
+  const result = readyPhaseObservation({ mainAttested: true, allWindowCount: 100, visibleWindowCount: 1, programRendererWindowCount: 1,
+    visibleProgramRendererCount: 1, rendererChecked: true, authStatus: "private", authReason: "secret", documentMeaningful: true, url: "private/path", innerText: "secret" });
+  assert.equal(result.allWindowCount, 16); assert.equal(result.authStatus, "unknown"); assert.equal(result.authReason, "unknown");
+  assert.doesNotMatch(JSON.stringify(result), /private|secret|path|innerText/);
+});
+
+test("failure-only auth diagnostic is bounded when the normal getState read does not return", async () => {
+  const result = await rendererReadySnapshot({ programAICloudAuth: { getState: () => new Promise(() => {}) } }, {});
+  assert.equal(result.authStatus, "unknown"); assert.equal(result.authReason, "timeout");
+});
 
 test("actual child exit metadata retains bounded exit/signal facts without PID or arbitrary error text", () => {
   const child = new EventEmitter(); child.exitCode = null; child.signalCode = null;
@@ -486,6 +521,14 @@ test("live entrypoint remains CI-gated and never uses source imports, global kil
   assert.doesNotMatch(nativeHandoff, /\.emit\(|removeListener|checkForUpdates\(|quitAndInstall\(|\.message/);
   const finalCleanup = source.slice(source.indexOf("// Capture the actual pre-cleanup child exit"));
   assert.ok(finalCleanup.indexOf('check: "native_handoff_diagnostics"') < finalCleanup.indexOf("await terminateOwned(executable"));
+  const readiness = source.slice(source.indexOf("async function ready(control)"), source.indexOf("export async function rendererReadySnapshot("));
+  assert.match(readiness, /timeoutMs: 90000, code: "signed_out_preload_unavailable"/);
+  assert.match(readiness, /status==='signed_out'&&document\.body\.innerText\.trim\(\)\.length>20/);
+  const readyDiagnostic = source.slice(source.indexOf("export async function rendererReadySnapshot("), source.indexOf("async function sidecar("));
+  assert.doesNotMatch(readyDiagnostic, /awaitInitialization\(|updater\.check\(|updater\.install\(|\.signIn\(|\.refresh\(/);
+  assert.match(readyDiagnostic, /getAllWindows\(\)/);
+  assert.match(source, /code === "signed_out_preload_unavailable" && control\) await reportReadyFailure\(control\)/);
+  assert.ok(source.indexOf("await reportReadyFailure(control)") < source.indexOf("// Capture the actual pre-cleanup child exit"));
   assert.match(source, /if \(pins\.version === "1\.0\.10"\) await nativeShellCommandRegression/);
   assert.doesNotMatch(source, /window\.api\.updater\.install\(\)\.catch\(\(\)=>\{\}\)/);
 });
