@@ -1,16 +1,61 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   SCENARIOS, bootstrapMain, byteRange, caseReceipt, evaluatePaused, loopbackUrl, metadata, parseScenario, pausedCallFrame,
-  payloadChunk, rejectionOutcome, shellSeedObservation, syntheticShellCommand, updaterObservation, validatePreservation,
+  createInstallPromiseObserver, createNativeSignatureObserver, installPromiseObservation, nativeShellCommandFixture, payloadChunk,
+  rejectionOutcome, replacementObservation, shellSeedObservation, signatureInstallOutcome, syntheticShellCommand, updaterObservation, validatePreservation,
 } from "./verify-update.mjs";
 
 const traffic = () => ({ metadata: 1, zip: 1, sent: 100, expectedBytes: 100, corrupted: 1, interrupted: 1 });
 const state = () => ({ marker: "synthetic\n", store: "unsent canary", session: "session_synthetic_1",
   title: "Synthetic shell chat", messages: ["message_1", "message_2"], signedOut: true });
+
+test("actual install promise observer captures resolution/rejection without raw errors or mutable snapshot inference", async () => {
+  const resolved = createInstallPromiseObserver(() => Promise.resolve());
+  const snapshot = resolved.read(); snapshot.outcome = "resolved";
+  assert.equal(resolved.read().outcome, "pending");
+  resolved.start(); await Promise.resolve();
+  assert.deepEqual(resolved.read(), { outcome: "resolved", errorClass: "none" });
+  for (const [message, errorClass] of [["code signature invalid private-token", "signature"], ["Update is not ready private-token", "not_ready"],
+    ["EACCES private path", "permission"], ["network timeout secretURL", "network"], ["private other failure", "other"]]) {
+    const rejected = createInstallPromiseObserver(() => Promise.reject(new Error(message)));
+    rejected.start(); await Promise.resolve();
+    assert.deepEqual(rejected.read(), { outcome: "rejected", errorClass });
+    assert.doesNotMatch(JSON.stringify(rejected.read()), /private|secretURL/);
+  }
+  const synchronous = createInstallPromiseObserver(() => { throw new Error("private failure"); });
+  synchronous.start(); assert.equal(synchronous.read().outcome, "rejected");
+  assert.throws(() => installPromiseObservation({ outcome: "rejected", errorClass: "raw private error" }), { code: "install_observation_invalid" });
+});
+
+test("replacement diagnostics bound counts and expose only version/comparison facts, never PIDs, paths or hashes", () => {
+  const result = replacementObservation({ install: { outcome: "pending", errorClass: "none" }, oldPidChecked: true, oldPidAlive: false,
+    processCountsChecked: true, baseProcessCount: 0, candidateProcessCount: 0, newProcessCount: 99, installedVersion: "1.0.10",
+    installedCdhashChecked: true, installedAsarChecked: true, installedCandidateCdhashMatches: true, installedCandidateAsarMatches: true,
+    pid: 123456, path: "/Users/private", stderr: "secret", cdhash: "a".repeat(40), asarSha256: "b".repeat(64) });
+  assert.equal(result.newProcessCount, 16);
+  assert.equal(result.installedVersion, "1.0.10");
+  assert.equal(result.installedCandidateCdhashMatches, true);
+  assert.doesNotMatch(JSON.stringify(result), /123456|Users|secret|aaaa|bbbb/);
+  assert.equal(replacementObservation({ ...result, installedVersion: "private value" }).installedVersion, null);
+});
+
+test("native1.0.10 shell regression uses real LF and keeps quoted substitution literal through a profile-free parser", () => {
+  const fixture = nativeShellCommandFixture("/Users/runner/work/_temp/public-native-update-a1B2c3/synthetic-project");
+  assert.equal(fixture.command.split("\n").length, 2);
+  assert.match(fixture.command, /'literal \$\(\/usr\/bin\/printf MUST_STAY_LITERAL\)'/);
+  assert.equal(new Set([...fixture.command.matchAll(/(?:>|>>) '([^']+)'/g)].map((match) => match[1])).size, 1);
+  const stdoutOnly = fixture.command.replace(/ > '[^']+'/g, "").replace(/ >> '[^']+'/g, "");
+  const actual = execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", stdoutOnly], {
+    env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 5000, maxBuffer: 4096,
+  });
+  assert.equal(actual, fixture.expected);
+  assert.throws(() => nativeShellCommandFixture("/private/tmp/project"), { code: "synthetic_project_invalid" });
+});
 
 test("paused evaluation uses only the observed call frame and rejects asynchronous or exceptional results", async () => {
   assert.equal(pausedCallFrame({ callFrames: [{ callFrameId: "owned-frame" }] }), "owned-frame");
@@ -131,11 +176,50 @@ test("checksum rejection is never inferred from an unrelated error or incomplete
   assert.equal(rejectionOutcome("checksum", { status: "error", errorClass: "network" }, traffic()), "unverified");
 });
 
-test("wrong-signature rejection requires complete fault payload and actual signature category", () => {
-  assert.equal(rejectionOutcome("signature", { status: "error", errorClass: "signature" }, traffic()), "passed");
-  assert.equal(rejectionOutcome("signature", { status: "ready" }, traffic()), "failed");
-  assert.equal(rejectionOutcome("signature", { status: "error", errorClass: "checksum" }, traffic()), "unverified");
-  assert.equal(rejectionOutcome("signature", { status: "error", errorClass: "signature" }, { ...traffic(), sent: 1 }), "unverified");
+test("download-ready and controller error text alone never claim native signature acceptance or rejection", () => {
+  for (const observed of [{ status: "error", errorClass: "signature" }, { status: "ready" }, { status: "installing" }, { status: "error", errorClass: "checksum" }])
+    assert.equal(rejectionOutcome("signature", observed, traffic()), "unverified");
+});
+
+test("read-only native observer keeps product listeners and scrubs errors to actual Squirrel enums", () => {
+  const native = new EventEmitter(), app = new EventEmitter();
+  let sdkErrors = 0, nativeChecks = 0;
+  const sdk = () => { sdkErrors++; };
+  native.on("error", sdk);
+  native.checkForUpdates = () => { nativeChecks++; };
+  const originalCheck = native.checkForUpdates;
+  const observer = createNativeSignatureObserver(native, app);
+  const secret = "private path/token never emitted";
+  native.emit("error", Object.assign(new Error(secret), { domain: "SQRLCodeSignatureErrorDomain", code: -1 }));
+  assert.deepEqual(observer.read(), { errors: 1, signatureErrors: 1, signatureCode: -1, downloaded: false, beforeQuit: false });
+  assert.doesNotMatch(JSON.stringify(observer.read()), /private|token|path/);
+  // Mere words in a generic error do not count as a signature-domain error.
+  native.emit("error", new Error("Code signature failed " + secret));
+  assert.equal(observer.read().errors, 2);
+  assert.equal(observer.read().signatureErrors, 1);
+  native.emit("update-downloaded"); app.emit("before-quit");
+  assert.equal(observer.read().downloaded, true);
+  assert.equal(observer.read().beforeQuit, true);
+  observer.close();
+  assert.deepEqual(native.listeners("error"), [sdk]);
+  assert.equal(native.listenerCount("update-downloaded"), 0);
+  assert.equal(app.listenerCount("before-quit"), 0);
+  assert.equal(native.checkForUpdates, originalCheck);
+  assert.equal(nativeChecks, 0);
+  assert.equal(sdkErrors, 2);
+});
+
+test("signature acceptance needs real preload rejection, native signature enum and unchanged process/code/sidecar", () => {
+  const valid = { native: { errors: 1, signatureErrors: 1, signatureCode: -1, downloaded: false, beforeQuit: false },
+    attempt: { rejected: true, resolved: false }, originalPid: true, baseAsar: true, sidecarUnchanged: true, completePayload: true };
+  assert.equal(signatureInstallOutcome(valid), "passed");
+  for (const changed of [{ originalPid: false }, { baseAsar: false }, { sidecarUnchanged: false },
+    { native: { ...valid.native, downloaded: true } }, { native: { ...valid.native, beforeQuit: true } },
+    { attempt: { rejected: false, resolved: true } }]) assert.equal(signatureInstallOutcome({ ...valid, ...changed }), "failed");
+  for (const changed of [{ completePayload: false }, { attempt: { rejected: false, resolved: false } },
+    { native: { ...valid.native, errors: 0 } }, { native: { ...valid.native, signatureCode: null } },
+    { native: { ...valid.native, signatureErrors: 0 } }, { native: { ...valid.native, errors: 2 } }])
+    assert.equal(signatureInstallOutcome({ ...valid, ...changed }), "unverified");
 });
 
 test("downgrade requires metadata observation but no payload download", () => {
@@ -249,5 +333,17 @@ test("live entrypoint remains CI-gated and never uses source imports, global kil
   assert.doesNotMatch(bootstrap, /await evaluate\(main|awaitPromise/);
   assert.match(source, /feed\.select\("baseline"\)/);
   assert.match(source, /baselineTraffic\.zip === 0/);
+  assert.match(source, /await verifyNativeSignatureRejection\(control, base, before, traffic\)/);
+  assert.match(source, /window\.api\.updater\.install\(\)\.then/);
+  assert.match(source, /app\.quit\(\)/);
+  assert.match(source, /signature_restart_feed_not_quiescent/);
+  assert.ok(source.indexOf("await verifyNativeSignatureRejection(control, base, before, traffic)") < source.indexOf('phase = "signature_restart"'));
+  const nativeObserver = source.slice(source.indexOf("export function createNativeSignatureObserver("), source.indexOf("export function signatureInstallOutcome("));
+  assert.doesNotMatch(nativeObserver, /\.emit\(|checkForUpdates|quitAndInstall|setFeedURL|preventDefault|\.message/);
   assert.doesNotMatch(source, /console\.(?:error|log)\(error|JSON\.stringify\(connection|Authorization.*console/);
+  assert.match(source, /installObserver\.last = installPromiseObservation/);
+  assert.match(source, /targetType: "page", executable: base\.executable/);
+  assert.match(source, /check: "replacement_diagnostics"/);
+  assert.match(source, /if \(pins\.version === "1\.0\.10"\) await nativeShellCommandRegression/);
+  assert.doesNotMatch(source, /window\.api\.updater\.install\(\)\.catch\(\(\)=>\{\}\)/);
 });

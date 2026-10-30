@@ -19,7 +19,7 @@ Actual artifact hashes and signatures are checked before execution. Missing
 native browser/diagnostic capability is **unverified**, not a product pass.
 Fuses, TCC, Gatekeeper, quarantine, and signature checks must never be weakened.
 
-The two reviewed versions include paired conditional `msgpackr-extract` platform
+The reviewed baseline and candidate versions include paired conditional `msgpackr-extract` platform
 resources. The verifier checks their exact paths, package metadata, declared
 CPU, signed binary hashes, and loader hashes; the loader selects the current
 platform/architecture. This narrow resource rule does not admit other
@@ -34,3 +34,12 @@ pass and remains in the public test history.
 and byte sizes. Local build observations are not GitHub build attestations.
 Test assets and a successful trust check alone do not establish all production
 acceptance, account billing, voice, or native installation/update behavior.
+
+The current candidate is 1.0.10 with signed 1.0.8 as the update baseline. A
+download-ready state is not native signature acceptance: the signature-negative
+case exercises the unchanged Install preflight, requires an actual Squirrel
+signature-domain rejection with the original app/data still usable, then
+restarts normally before a genuine signed recovery update. Public receipts
+continue to exclude paid coding, production-account, editor-draft and queue
+claims. The post-update shell fixture checks only the packaged command boundary
+inside its disposable project.

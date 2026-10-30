@@ -93,7 +93,7 @@ export function validateArtifact(artifact, arch, extension, version) {
 }
 
 export function validatePins(pins) {
-  check(pins?.schemaVersion === 1 && pins.repository === PUBLIC_REPOSITORY && pins.version === "1.0.9" &&
+  check(pins?.schemaVersion === 1 && pins.repository === PUBLIC_REPOSITORY && pins.version === "1.0.10" &&
     pins.baseVersion === "1.0.8" && pins.teamId === "LH2479Y2F4" && pins.bundleId === "com.programai.desktop",
     "candidate_identity_invalid");
   check(pins.source?.repository === "roberttree/Program-ai-desktop" &&
@@ -399,11 +399,13 @@ const optionalResourcePins = {
     metadata: "115e306fbd59af670a4e85f5cc41900d90344211e65d6a91122c018132df48d6",
     "1.0.8": { arm64: "f4f350b4fcbadd64759f639989e42de84cc099658f79817311fd11479810c56f", x64: "d916b8c89dcfb91d0fe66281a7b33fbe453b182eb6a4759b40aec0b3d4464450" },
     "1.0.9": { arm64: "09faedccf609dde6fb72ca7d58a15e7e8d0baa3750a7bba26cf21e9119014745", x64: "c16822ba903aea8fa2d137573104f2bae2052b663f991324bac4f65c0d60e0d9" },
+    "1.0.10": { arm64: "66e1650211b7638b7d5523efec587362c423c274a1bfb4c413707827d86a5092", x64: "d4fa4e6dea93f0d6ff2ce7caabafd0667a06f02bd413c0d655c3baf14252151f" },
   },
   x64: {
     metadata: "753a3d68c775279b70dd7b5dc7c6868f9832d4d2090a8d428c98342b99989483",
     "1.0.8": { arm64: "5647133ba13f3046bd2fd4550f75a603e43f535c23f33d1bea0f011f4f1f8af9", x64: "b87080295249b4863652366929a54fa1d198058978a8414194e88d8ad843532f" },
     "1.0.9": { arm64: "fc5e0de17cd6dd5ba7ce4043ee39ae9f3b278e7830d2d16e38aef51fc76a01e8", x64: "4ae10898c6468be2b2a59592541182bf28b7857404c02e64c92f53659a22d7ea" },
+    "1.0.10": { arm64: "76a2731f1ec90b1072aa603ea8b906405f08bf1712772016fafeba4dfa3f6a54", x64: "72756bc219d3f9a283bf65195aa4cea000288ae885f889df5ca4be1bbfe3855f" },
   },
 };
 const optionalLoaderPins = {
@@ -414,7 +416,7 @@ const optionalLoaderPins = {
 
 export function validateMachOInventory({ arch, version, files, resources, loaders }) {
   check(["arm64", "x64"].includes(arch), "unsupported_architecture");
-  check(["1.0.8", "1.0.9"].includes(version), "optional_resource_version_unreviewed", "failed");
+  check(["1.0.8", "1.0.9", "1.0.10"].includes(version), "optional_resource_version_unreviewed", "failed");
   check(Array.isArray(files) && files.length > 1 && files.length <= 40000,
     "bundle_native_code_missing", "failed");
   const entries = new Map();
