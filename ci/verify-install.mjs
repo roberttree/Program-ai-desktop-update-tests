@@ -14,10 +14,20 @@ const CHROME = "/Applications/Google Chrome.app";
 const CHROME_EXECUTABLE = `${CHROME}/Contents/MacOS/Google Chrome`;
 const INSTALLED_APP = "/Applications/Program AI Desktop.app";
 
-export function normalOpenDialog({ text, buttons }, application) {
-  return ["Google Chrome", "Program AI Desktop"].includes(application) && Array.isArray(text) && Array.isArray(buttons) &&
+export function normalOpenDialog({ text, buttons, extraButtons = [] }, application) {
+  const namedButtons = Array.isArray(buttons) && buttons.filter((name) => name === "Open").length === 1 &&
+    buttons.filter((name) => name === "Cancel").length === 1;
+  const extra = Array.isArray(buttons) ? buttons.filter((name) => name !== "Open" && name !== "Cancel") : [];
+  const fact = Array.isArray(extraButtons) && extraButtons.length === 1 ? extraButtons[0] : undefined;
+  // Native macOS receipts showed one additional AXButton with NO name/subrole.
+  // It is never clicked or described as Help. Any named/ambiguous extra fails.
+  const unnamed = namedButtons && buttons.length === 3 && extra.length === 1 &&
+    (extra[0] === undefined || extra[0] === null || extra[0] === "") && fact?.nameLength === 0 && fact.nameTooLong === false &&
+    fact.subrole === "missing" && (extra[0] === "" ? fact.nameKind === "empty" && fact.label === "" :
+      fact.nameKind === "missing" && !Object.prototype.hasOwnProperty.call(fact, "label"));
+  return ["Google Chrome", "Program AI Desktop"].includes(application) && Array.isArray(text) && Array.isArray(buttons) && Array.isArray(extraButtons) &&
     text.length > 0 && text.length <= 8 && text.every((item) => typeof item === "string" && item.length <= 2048) &&
-    buttons.length === 2 && buttons.includes("Open") && buttons.includes("Cancel") &&
+    namedButtons && (buttons.length === 2 && extraButtons.length === 0 || unnamed) &&
     text.some((item) => item.includes(application)) && /downloaded from the internet/i.test(text.join(" ")) &&
     /are you sure.*open/i.test(text.join(" ")) &&
     !/damaged|malware|cannot be opened|can.t be opened|unidentified|open anyway|trash|bin/i.test(text.join(" "));
@@ -154,7 +164,7 @@ export function inspectNormalOpenAgent(agent, application, classify, errorFlags,
     observed.openConfirmation = /are you sure.*open/i.test(words);
     observed.blockedWarning = /damaged|malware|cannot be opened|can.t be opened|unidentified|open anyway|trash|bin/i.test(words);
     observed.querySucceeded = true;
-    observed.classifierMatched = classify({ text, buttons }, application) && open.length === 1;
+    observed.classifierMatched = classify({ text, buttons, extraButtons: privateExtraButtons }, application) && open.length === 1;
     if (!observed.classifierMatched || observed.automationDenied || observed.accessibilityDenied) { observed.status = "classifier_nonmatch"; return observed; }
     open[0].click(); observed.approved = true; observed.status = "approved";
   } catch (error) {
@@ -190,9 +200,14 @@ export function normalOpenQueryDiagnostic(result) {
     subrole: ["AXHelpButton", "other", "missing"].includes(button?.subrole) ? button.subrole : "missing",
     labelSha256: typeof button?.label === "string" && button.label.length <= 64 ? createHash("sha256").update(button.label).digest("hex") : null,
   }));
+  const plain = output.buttonCount === 2 && output.extraButtonCount === 0 && output.extraButtonCategory === "none" && output.extraButtons.length === 0;
+  const rawExtra = Array.isArray(value.privateExtraButtons) && value.privateExtraButtons.length === 1 ? value.privateExtraButtons[0] : undefined;
+  const unnamed = output.buttonCount === 3 && output.extraButtonCount === 1 && output.extraButtonCategory === "unknown" &&
+    output.extraButtons.length === 1 && rawExtra?.nameLength === 0 && rawExtra.nameTooLong === false && rawExtra.subrole === "missing" &&
+    (rawExtra.nameKind === "missing" && !Object.prototype.hasOwnProperty.call(rawExtra, "label") ||
+      rawExtra.nameKind === "empty" && rawExtra.label === "" && output.extraButtons[0].labelSha256 === createHash("sha256").update("").digest("hex"));
   output.approved = result.exitCode === 0 && output.querySucceeded && output.status === "approved" && value.approved === true &&
-    output.classifierMatched && output.windowCount === 1 && output.buttonCount === 2 && output.openButtonCount === 1 &&
-    output.cancelButtonCount === 1 && output.extraButtonCount === 0 && output.extraButtonCategory === "none";
+    output.classifierMatched && output.windowCount === 1 && output.openButtonCount === 1 && output.cancelButtonCount === 1 && (plain || unnamed);
   return output;
 }
 
@@ -260,8 +275,9 @@ export function createProgramLaunchResolver({ pins, arch, expected, installed },
 
 const normalOpenHistory = new Map();
 async function approveNormalOpen(application) {
-  // Only the unchanged full exact-name Open/Cancel classifier can click. No
-  // grants, OS security changes or unclassified dialogs are actionable.
+  // Only the full exact-name Open/Cancel classifier can click literal Open.
+  // The observed optional unnamed control is NEVER acted on. No grants, OS
+  // security changes or unclassified dialogs are actionable.
   const script = `JSON.stringify((${inspectNormalOpenAgent.toString()})(Application("System Events").applicationProcesses.byName("CoreServicesUIAgent"),${JSON.stringify(application)},(${normalOpenDialog.toString()}),(${normalOpenErrorFlags.toString()}),(${normalOpenButtonFacts.toString()})))`;
   const result = await run("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeoutMs: 10000, maxBytes: 16384, allowFailure: true });
   const diagnostic = normalOpenQueryDiagnostic(result);

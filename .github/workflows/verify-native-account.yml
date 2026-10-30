@@ -1,0 +1,44 @@
+name: Verify disposable native desktop accounts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: disposable-native-account-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'roberttree/Program-ai-desktop-update-tests' && github.event.repository.private == false && github.actor_id == '88110976' && github.ref == 'refs/heads/main'
+    name: ${{ matrix.arch }} account and queue
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      VERIFY_ARCH: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - name: Read the reviewed public verification source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify pure test-driver contracts without credentials
+        run: node --test ci/*.test.mjs
+      - name: Verify actual account handoff and queued file creation
+        run: node ci/native-account-queue.mjs
+        env:
+          PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_EMAIL || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_ARM64_PASSWORD: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_PASSWORD || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE: ${{ matrix.arch == 'arm64' && secrets.PROGRAM_AI_NATIVE_1_0_10_ARM64_LEASE || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_EMAIL || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_PASSWORD || '' }}
+          PROGRAM_AI_NATIVE_1_0_10_X64_LEASE: ${{ matrix.arch == 'x64' && secrets.PROGRAM_AI_NATIVE_1_0_10_X64_LEASE || '' }}

@@ -21,13 +21,13 @@ test("vendor Chrome signature diagnostics expose fixed categories/exit only and 
 });
 
 function normalDialogFixture({ text = '“Program AI Desktop” is an app downloaded from the Internet. Are you sure you want to open it?', valueAvailable = true, valueError, role = "AXStaticText", buttons = ["Cancel", "Open"], extraSubrole } = {}) {
-  let clicked = 0;
-  const leaf = (role, name) => ({ role: () => role, name: () => name, uiElements: () => [], click: () => { clicked++; } });
+  let clicked = 0; const clickedNames = [];
+  const leaf = (role, name) => ({ role: () => role, name: () => name, uiElements: () => [], click: () => { clicked++; clickedNames.push(name); } });
   const content = { ...leaf(role, text), attributes: { byName: () => ({ exists: () => valueAvailable,
     value: () => { if (valueError) throw valueError; return text; } }) } };
   const window = { role: () => "AXWindow", uiElements: () => [content, ...buttons.map((name) => ({ ...leaf("AXButton", name),
     attributes: { byName: (attribute) => ({ exists: () => attribute === "AXSubrole" && extraSubrole !== undefined, value: () => extraSubrole }) } }))] };
-  return { agent: { exists: () => true, windows: () => [window] }, clicked: () => clicked };
+  return { agent: { exists: () => true, windows: () => [window] }, clicked: () => clicked, clickedNames: () => clickedNames };
 }
 
 test("normal Open diagnostics distinguish missing agent/windows, actual access denial and generic query errors", () => {
@@ -108,6 +108,54 @@ test("unknown extra button labels are RAM-only and public diagnostics contain on
   const malformed = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify({ privateExtraButtons: Array(20).fill({ nameKind: "private", nameLength: 1000, subrole: "private", label: "/private/value" }) }) });
   assert.equal(malformed.extraButtons.length, 16);
   assert.doesNotMatch(JSON.stringify(malformed), /\/private\/value|"private"/);
+});
+
+test("observed optional unnamed OS control permits only literal Open and retains the ordinary consent classifier", () => {
+  for (const name of [undefined, null, ""]) {
+    const fixture = normalDialogFixture({ buttons: ["Cancel", "Open", name] });
+    const observed = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+    const receipt = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(observed) });
+    assert.equal(observed.approved, true); assert.equal(receipt.approved, true);
+    assert.deepEqual(fixture.clickedNames(), ["Open"]); // Never the unnamed control.
+    assert.equal(receipt.extraButtons[0].nameLength, 0); assert.equal(receipt.extraButtons[0].subrole, "missing");
+    assert.equal(receipt.extraButtons[0].nameKind, name === "" ? "empty" : "missing");
+  }
+  const two = normalDialogFixture();
+  assert.equal(inspectNormalOpenAgent(two.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags).approved, true);
+  assert.deepEqual(two.clickedNames(), ["Open"]);
+});
+
+test("unnamed-control tolerance rejects every named, duplicate, boolean, control-character or ambiguous extra", () => {
+  for (const buttons of [["Cancel", "Open", "Open Anyway"], ["Cancel", "Open", "Trash"], ["Cancel", "Open", "private unknown label"],
+    ["Cancel", "Open", "Help"], ["Cancel", "Open", "?"], ["Cancel", "Open", "Show Web Page"], ["Cancel", "Open", false],
+    ["Cancel", "Open", true], ["Cancel", "Open", 0], ["Cancel", "Open", {}], ["Cancel", "Open", "\u0000"],
+    ["Cancel", "Open", " "], ["Cancel", "Open", "Open\u0000"], ["Cancel", "Open", "Open"], ["Cancel", "Cancel", "Open"],
+    ["Cancel", "Open", undefined, undefined]]) {
+    const fixture = normalDialogFixture({ buttons });
+    const observed = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+    assert.equal(observed.approved, false); assert.equal(fixture.clicked(), 0);
+    assert.equal(normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(observed) }).approved, false);
+  }
+  for (const options of [{ extraSubrole: "AXHelpButton" }, { text: null, valueAvailable: false },
+    { text: "Program AI Desktop is downloaded from the Internet. Are you sure you want to open it? It is damaged." }]) {
+    const fixture = normalDialogFixture({ buttons: ["Cancel", "Open", undefined], ...options });
+    const observed = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+    assert.equal(observed.approved, false); assert.equal(fixture.clicked(), 0);
+  }
+});
+
+test("public approval needs exact observed extra-control metadata and cannot accept invented labels or malformed proof", () => {
+  const fixture = normalDialogFixture({ buttons: ["Cancel", "Open", undefined] });
+  const observed = inspectNormalOpenAgent(fixture.agent, "Program AI Desktop", normalOpenDialog, normalOpenErrorFlags);
+  for (const fields of [{ nameLength: 1 }, { nameLength: null }, { nameTooLong: true }, { nameTooLong: "false" },
+    { subrole: "AXHelpButton" }, { subrole: "other" }, { nameKind: "nonempty" }, { label: "private injected control" }]) {
+    const value = { ...observed, privateExtraButtons: [{ ...observed.privateExtraButtons[0], ...fields }] };
+    const receipt = normalOpenQueryDiagnostic({ exitCode: 0, stdout: JSON.stringify(value) });
+    assert.equal(receipt.approved, false); assert.doesNotMatch(JSON.stringify(receipt), /private injected control/);
+  }
+  const dialog = { text: ['Program AI Desktop is downloaded from the Internet. Are you sure you want to open it?'], buttons: ["Cancel", "Open", undefined] };
+  assert.equal(normalOpenDialog(dialog, "Program AI Desktop"), false);
+  assert.equal(normalOpenDialog({ ...dialog, extraButtons: null }, "Program AI Desktop"), false);
 });
 
 const installedApp = "/Applications/Program AI Desktop.app";
